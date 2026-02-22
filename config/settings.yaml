@@ -35,8 +35,9 @@ datasources:
     client_id: ""
     client_secret: ""
     # Binance 兜底 (RTDS 不可用时自动降级)
-    binance_ws: "wss://stream.binance.com:9443/ws/btcusdt@trade"
-    binance_rest: "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+    # 使用 binance.vision 公开数据节点, 无地区限制
+    binance_ws: "wss://data-stream.binance.vision:9443/ws/btcusdt@trade"
+    binance_rest: "https://data-api.binance.vision/api/v3/ticker/price?symbol=BTCUSDT"
     # 链上 Price Feed (最后兜底)
     polygon_rpc: "https://polygon-bor-rpc.publicnode.com"
 
