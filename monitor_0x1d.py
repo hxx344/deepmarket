@@ -1222,25 +1222,6 @@ def _do_rtds_settle(settle_price: float, ptb: float):
         state._pending_settle = None
         return
     won = "UP" if settle_price > ptb else "DOWN"
-
-
-def _resolve_ptb(end_ts: int) -> float:
-    """获取旧窗口的 PTB, 多层回退确保不为 0。
-    优先级: _rtds_boundary.old_ptb > state.window_ptb > buffer回溯(窗口开始)
-    """
-    bd = state._rtds_boundary
-    if bd and time.time() - bd.get("at", 0) < 30:
-        ptb = bd["old_ptb"]
-        if ptb > 0:
-            return ptb
-    if state.window_ptb > 0:
-        return state.window_ptb
-    # 从缓冲区回溯旧窗口开始时间
-    if end_ts:
-        ptb = state.lookup_price_at(float(end_ts - 300))
-        if ptb > 0:
-            return ptb
-    return 0.0
     src = "RTDS"
     total_cost = ps["cum_up_cost"] + ps["cum_dn_cost"]
     if total_cost > 0:
@@ -1272,6 +1253,25 @@ def _resolve_ptb(end_ts: int) -> float:
             f"结算价=${settle_price:,.2f} vs PTB=${ptb:,.2f}"
         )
     state._pending_settle = None
+
+
+def _resolve_ptb(end_ts: int) -> float:
+    """获取旧窗口的 PTB, 多层回退确保不为 0。
+    优先级: _rtds_boundary.old_ptb > state.window_ptb > buffer回溯(窗口开始)
+    """
+    bd = state._rtds_boundary
+    if bd and time.time() - bd.get("at", 0) < 30:
+        ptb = bd["old_ptb"]
+        if ptb > 0:
+            return ptb
+    if state.window_ptb > 0:
+        return state.window_ptb
+    # 从缓冲区回溯旧窗口开始时间
+    if end_ts:
+        ptb = state.lookup_price_at(float(end_ts - 300))
+        if ptb > 0:
+            return ptb
+    return 0.0
 
 
 def _try_settle_from_boundary(ps: dict):
