@@ -44,8 +44,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_REST = "https://clob.polymarket.com"
 # Binance 域名 (可通过环境变量覆盖, 应对地区封锁)
 # 备选: stream.binance.us / data-stream.binance.vision
-_BN_HOST = os.environ.get("BN_HOST", "stream.binance.com")
-_BN_API  = os.environ.get("BN_API",  "api.binance.com")
+_BN_HOST = os.environ.get("BN_HOST", "data-stream.binance.vision")
+_BN_API  = os.environ.get("BN_API",  "data-api.binance.vision")
 BINANCE_WS = f"wss://{_BN_HOST}:9443/ws/btcusdt@trade"
 BINANCE_REST = f"https://{_BN_API}/api/v3/ticker/price?symbol=BTCUSDT"
 PM_RTDS_WS = "wss://ws-live-data.polymarket.com"
