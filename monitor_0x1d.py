@@ -1291,20 +1291,47 @@ def _get_settle_price(end_ts: int) -> tuple[float, str]:
     return 0.0, "无"
 
 
+SETTLE_RTDS_WAIT = 5  # 等待 RTDS 0秒价格的秒数
+
+
 def _settle_pending():
-    """创建 _pending_settle 后立即尝试结算。
-    不再依赖 RTDS 0秒价格异步到达, 直接用最佳可用结算价。"""
+    """创建 _pending_settle 后:
+    1. RTDS 边界缓存已有 → 立即用 RTDS 价格结算
+    2. 否则延迟 5s 等 RTDS inline 结算, 超时再用 Buffer 回溯
+    """
     ps = state._pending_settle
     if not ps:
         return
+    # 先检查 RTDS 边界缓存是否已精确匹配
     settle_price, src = _get_settle_price(ps["end_ts"])
-    if settle_price > 0 and ps["ptb"] > 0:
-        _do_settle(settle_price, ps["ptb"], src)
-    elif settle_price > 0:
-        # ptb=0, _do_settle 会尝试恢复
-        _do_settle(settle_price, 0.0, src)
-    else:
-        print(f"[结算] ⚠ 无可用结算价, 等待超时回退")
+    if src == "RTDS" and settle_price > 0:
+        # RTDS 已缓存, 立即结算
+        _do_settle(settle_price, ps["ptb"] or 0.0, src)
+        return
+
+    # RTDS 尚未到达, 延迟等待 — RTDS inline handler 可能在这期间结算
+    print(f"[结算] 等待RTDS精确价格 ({SETTLE_RTDS_WAIT}s)...")
+
+    async def _delayed_settle():
+        await asyncio.sleep(SETTLE_RTDS_WAIT)
+        if not state._pending_settle:
+            return  # 已被 RTDS inline 结算
+        ps2 = state._pending_settle
+        settle_price, src = _get_settle_price(ps2["end_ts"])
+        if settle_price <= 0:
+            settle_price = state.btc_price
+            src = "当前价(延迟)"
+        if settle_price > 0:
+            _do_settle(settle_price, ps2["ptb"] or 0.0, f"{src}(延迟)")
+        else:
+            print("[结算] ⚠ 延迟后仍无结算价, 等待超时回退")
+
+    try:
+        asyncio.get_event_loop().create_task(_delayed_settle())
+    except RuntimeError:
+        # 无事件循环 (不应发生), 直接结算
+        if settle_price > 0:
+            _do_settle(settle_price, ps["ptb"] or 0.0, src)
 
 
 def calc_window_ts() -> tuple[int, int, float]:
