@@ -1502,6 +1502,14 @@ SETTLE_TIMEOUT = 120        # 结算超时秒数 (正常应立即结算, 此处�
 
 async def pm_price_loop():
     """PM 报价 + 窗口轮换主循环"""
+    # 等待至少一个价格源就绪, 避免首次窗口 PTB=$0
+    for _ in range(50):  # 最多等 5s
+        if state.btc_price > 0:
+            break
+        await asyncio.sleep(0.1)
+    if state.btc_price <= 0:
+        print("[PM] ⚠ 价格源未就绪, 继续启动 (PTB 可能不准)")
+
     async with aiohttp.ClientSession() as session:
         while True:
             try:
