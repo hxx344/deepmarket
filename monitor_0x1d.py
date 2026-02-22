@@ -1168,7 +1168,10 @@ async def chainlink_rtds_stream():
 
                                     # ── 旧窗口即时结算 (如果 _pending_settle 已存在) ──
                                     if state._pending_settle:
-                                        _do_rtds_settle(price, state._pending_settle["ptb"])
+                                        # 优先用 _pending_settle 保存的 PTB;
+                                        # 如果为0, 用 old_ptb (当前 window_ptb, 还未被覆写)
+                                        settle_ptb = state._pending_settle["ptb"] or old_ptb
+                                        _do_rtds_settle(price, settle_ptb)
 
                                     # ── 新窗口 PTB ──
                                     state.window_ptb = price
@@ -1209,10 +1212,35 @@ def _do_rtds_settle(settle_price: float, ptb: float):
     ps = state._pending_settle
     if not ps:
         return
-    if ptb > 0:
-        won = "UP" if settle_price > ptb else "DOWN"
-    else:
-        won = "UP"
+    # PTB 恢复: 如果 ptb=0, 从价格缓冲区回溯旧窗口开始时间
+    if ptb <= 0 and ps.get("end_ts"):
+        ptb = state.lookup_price_at(float(ps["end_ts"] - 300))
+        if ptb > 0:
+            print(f"[RTDS结算] PTB恢复: 从缓冲区回溯得 PTB=${ptb:,.2f}")
+    if ptb <= 0:
+        print(f"[RTDS结算] ⚠ PTB=0 无法判定 UP/DOWN, 跳过结算")
+        state._pending_settle = None
+        return
+    won = "UP" if settle_price > ptb else "DOWN"
+
+
+def _resolve_ptb(end_ts: int) -> float:
+    """获取旧窗口的 PTB, 多层回退确保不为 0。
+    优先级: _rtds_boundary.old_ptb > state.window_ptb > buffer回溯(窗口开始)
+    """
+    bd = state._rtds_boundary
+    if bd and time.time() - bd.get("at", 0) < 30:
+        ptb = bd["old_ptb"]
+        if ptb > 0:
+            return ptb
+    if state.window_ptb > 0:
+        return state.window_ptb
+    # 从缓冲区回溯旧窗口开始时间
+    if end_ts:
+        ptb = state.lookup_price_at(float(end_ts - 300))
+        if ptb > 0:
+            return ptb
+    return 0.0
     src = "RTDS"
     total_cost = ps["cum_up_cost"] + ps["cum_dn_cost"]
     if total_cost > 0:
@@ -1286,8 +1314,7 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
     def _fallback_switch():
         """Gamma API 不可用/返回空时, 至少基于时间切换窗口slug"""
         if state.window_slug and state.trade_count_window > 0:
-            bd = state._rtds_boundary
-            saved_ptb = bd["old_ptb"] if (bd and time.time() - bd["at"] < 30) else state.window_ptb
+            saved_ptb = _resolve_ptb(state.window_end_ts)
             state._pending_settle = {
                 "slug": state.window_slug,
                 "question": state.window_question,
@@ -1355,8 +1382,7 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
 
             # ── 旧窗口标记待结算 (优先用 RTDS 边界缓存即时结算) ──
             if state.window_slug and state.window_slug != slug:
-                bd = state._rtds_boundary
-                saved_ptb = bd["old_ptb"] if (bd and time.time() - bd["at"] < 30) else state.window_ptb
+                saved_ptb = _resolve_ptb(state.window_end_ts)
                 state._pending_settle = {
                     "slug": state.window_slug,
                     "question": state.window_question,
@@ -1729,8 +1755,7 @@ async def poll_0x1d_activity():
                                         print(f"[Activity] ⚡ 检测到新窗口 (交易驱动切换): {slug}")
                                         # 保存旧窗口到 pending settle
                                         if state.window_slug and state.trade_count_window > 0:
-                                            bd = state._rtds_boundary
-                                            saved_ptb = bd["old_ptb"] if (bd and time.time() - bd["at"] < 30) else state.window_ptb
+                                            saved_ptb = _resolve_ptb(state.window_end_ts)
                                             state._pending_settle = {
                                                 "slug": state.window_slug,
                                                 "question": state.window_question,
