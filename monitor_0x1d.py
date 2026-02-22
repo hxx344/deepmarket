@@ -1214,16 +1214,47 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
     if slug == state.window_slug:
         return True  # 已经是当前窗口
 
+    def _fallback_switch():
+        """Gamma API 不可用/返回空时, 至少基于时间切换窗口slug"""
+        if state.window_slug and state.trade_count_window > 0:
+            state._pending_settle = {
+                "slug": state.window_slug,
+                "question": state.window_question,
+                "end_ts": state.window_end_ts,
+                "settle_at": (state.window_end_ts or time.time()) + SETTLE_DELAY_SECS,
+                "ptb": state.window_ptb,
+                "cum_up_shares": state.cum_up_shares,
+                "cum_dn_shares": state.cum_dn_shares,
+                "cum_up_cost": state.cum_up_cost,
+                "cum_dn_cost": state.cum_dn_cost,
+                "trade_count": state.trade_count_window,
+                "end_up_price": state.up_price,
+                "end_dn_price": state.dn_price,
+            }
+        state.window_slug = slug
+        state.window_start_ts = ws
+        state.window_end_ts = we
+        ptb = state.lookup_price_at(float(ws))
+        if ptb <= 0:
+            ptb = state.btc_price
+        state.window_ptb = ptb
+        state.ptb_source = "时间回退"
+        state.reset_window()
+
     try:
         url = f"{GAMMA_API}/events?slug={slug}"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             events = await r.json()
             if not events:
+                print(f"[PM] Gamma API 返回空 (事件可能尚未创建), 回退切换: {slug}")
+                _fallback_switch()
                 return False
 
             ev = events[0]
             markets = ev.get("markets", [])
             if not markets:
+                print(f"[PM] 事件无 market, 回退切换: {slug}")
+                _fallback_switch()
                 return False
 
             # 只有 1 个 market，包含 2 个 outcomes (Up / Down)
@@ -1236,6 +1267,7 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
             tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
 
             if len(outcomes) < 2 or len(tokens) < 2:
+                _fallback_switch()
                 return False
 
             # 找 UP 和 DOWN 在 outcomes 中的索引
@@ -1298,6 +1330,9 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
             return True
     except Exception as e:
         print(f"[PM] 窗口发现失败: {e}")
+        if slug != state.window_slug:
+            print(f"[PM] 回退: 使用时间戳切换窗口 {slug}")
+            _fallback_switch()
         return False
 
 
@@ -1604,6 +1639,22 @@ async def poll_0x1d_activity():
     """轮询 0x1d 账号最新交易"""
     seen_txs: set[str] = set()
     last_seen_ts: int = 0
+    _dropped_non_btc = 0  # 非 BTC 交易计数 (静默丢弃)
+
+    # 等待初始窗口发现 (避免启动时丢交易)
+    for _ in range(30):  # 最多等 15 秒
+        if state.window_slug:
+            break
+        await asyncio.sleep(0.5)
+    if not state.window_slug:
+        # 仍未发现窗口 → 自行从时间戳计算
+        ws = int(time.time()); ws = ws - ws % 300
+        state.window_slug = f"{SLUG_PREFIX}{ws}"
+        state.window_start_ts = ws
+        state.window_end_ts = ws + 300
+        ptb = state.btc_price or 0
+        state.window_ptb = ptb
+        print(f"[Activity] ⚠ 窗口超时, 自行初始化: {state.window_slug}")
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -1621,20 +1672,31 @@ async def poll_0x1d_activity():
                         # 倒序处理 (最旧在前)
                         new_trades = []
                         for t in reversed(trades):
+                          try:  # ── 单笔交易异常隔离 ──
                             # 用 transactionHash + outcomeIndex 做去重
                             tx = t.get("transactionHash", "") + "_" + str(t.get("outcomeIndex", 0))
                             if tx in seen_txs:
                                 continue
                             seen_txs.add(tx)
-                            # 太多就清理
+                            # 太多就清理 (保留后半部分以免老tx重入)
                             if len(seen_txs) > 5000:
+                                # 只保留最近加入的 (set无序, 但清空后老tx会重入seen但DB去重)
                                 seen_txs.clear()
 
-                            # 只关注当前窗口的 BTC 5-min
+                            # 获取 slug
                             slug = t.get("eventSlug", "") or t.get("slug", "")
+                            is_btc_5m = SLUG_PREFIX in slug
 
-                            # ── 迟到的旧窗口交易: 追补到 _pending_settle ──
+                            # ── 非 BTC 5-min 交易: 静默跳过 ──
+                            if not is_btc_5m:
+                                _dropped_non_btc += 1
+                                if _dropped_non_btc % 50 == 1:
+                                    print(f"[Activity] 跳过非BTC交易 (累计{_dropped_non_btc}) slug={slug[:40]}")
+                                continue
+
+                            # ── BTC 5-min 交易, 但 slug 不匹配当前窗口 ──
                             if state.window_slug and slug != state.window_slug:
+                                # Case 1: 迟到的旧窗口交易 → 追补到 _pending_settle
                                 if (state._pending_settle
                                         and state._pending_settle.get("slug") == slug):
                                     outcome_late = t.get("outcome", "")
@@ -1649,7 +1711,49 @@ async def poll_0x1d_activity():
                                         state._pending_settle["cum_dn_cost"] += usdc_late
                                     state._pending_settle["trade_count"] += 1
                                     print(f"[Activity] 迟到交易追补到待结算窗口: {side_late} {shares_late:.1f}sh ${usdc_late:.2f}")
-                                continue
+                                    continue
+
+                                # Case 2: 新窗口的交易 (discover_pm_window 还没更新)
+                                # ── 热切换: 从交易 slug 中提取窗口时间, 立即切换 ──
+                                try:
+                                    ts_from_slug = int(slug.replace(SLUG_PREFIX, ""))
+                                    if ts_from_slug > (state.window_start_ts or 0):
+                                        print(f"[Activity] ⚡ 检测到新窗口 (交易驱动切换): {slug}")
+                                        # 保存旧窗口到 pending settle
+                                        if state.window_slug and state.trade_count_window > 0:
+                                            state._pending_settle = {
+                                                "slug": state.window_slug,
+                                                "question": state.window_question,
+                                                "end_ts": state.window_end_ts,
+                                                "settle_at": (state.window_end_ts or time.time()) + SETTLE_DELAY_SECS,
+                                                "ptb": state.window_ptb,
+                                                "cum_up_shares": state.cum_up_shares,
+                                                "cum_dn_shares": state.cum_dn_shares,
+                                                "cum_up_cost": state.cum_up_cost,
+                                                "cum_dn_cost": state.cum_dn_cost,
+                                                "trade_count": state.trade_count_window,
+                                                "end_up_price": state.up_price,
+                                                "end_dn_price": state.dn_price,
+                                            }
+                                        # 切换到新窗口
+                                        state.window_slug = slug
+                                        state.window_start_ts = ts_from_slug
+                                        state.window_end_ts = ts_from_slug + 300
+                                        # PTB 估计: 从价格缓冲区回溯到窗口开始时间
+                                        ptb = state.lookup_price_at(float(ts_from_slug))
+                                        if ptb <= 0:
+                                            ptb = state.btc_price
+                                        state.window_ptb = ptb
+                                        state.ptb_source = "交易驱动切换"
+                                        state.reset_window()
+                                        print(f"[Activity] 新窗口就绪 (PTB=${ptb:,.2f}), 继续处理交易...")
+                                    else:
+                                        # 更老的窗口, 无法追补 → 跳过
+                                        print(f"[Activity] ⚠ 跳过过期BTC交易: {slug[-15:]} (当前={state.window_slug[-15:]})")
+                                        continue
+                                except (ValueError, TypeError):
+                                    print(f"[Activity] ⚠ 无法解析BTC slug: {slug}")
+                                    continue
 
                             # 解析
                             outcome = t.get("outcome", "")
@@ -1658,6 +1762,10 @@ async def poll_0x1d_activity():
                             price = float(t.get("price", 0))
                             usdc = float(t.get("usdcSize", 0))
                             ts_int = int(t.get("timestamp", 0))
+
+                            # 跳过无效交易 (如 CTF redemption, price=0)
+                            if price <= 0 or shares <= 0:
+                                continue
 
                             # 生成可读时间
                             from datetime import datetime as _dt, timezone as _tz
@@ -1956,6 +2064,10 @@ async def poll_0x1d_activity():
                             )
                             if _feature_latency > 2.0:
                                 print(f"[Feature] ⚠ 特征回溯 {_feature_latency:.1f}s ({pm_snap.get('ts', 0) > 0 and 'PM有历史' or 'PM用当前'})")
+
+                          except Exception as _trade_err:
+                            # 单笔交易处理失败 → 跳过本笔, 不影响后续交易
+                            print(f"[Activity] ⚠ 单笔交易处理异常: {_trade_err}")
 
                         # Burst 检测: 同一秒内 >= 3 笔
                         if len(new_trades) >= 3:
