@@ -109,12 +109,21 @@ PM_ORDERBOOK = [
 ]
 # 窗口上下文 (推理时可获得)
 WINDOW_CONTEXT = ["elapsed", "elapsed_pct"]
+# 时间特征 (交易时段对行为模式有显著影响)
+TIME_FEATURES = [
+    "hour_utc",        # UTC 小时 (0-23)
+    "minute_utc",      # UTC 分钟 (0-59)
+    "day_of_week",     # 星期几 (0=Mon, 6=Sun)
+    "us_session",      # 美股时段: 0=closed, 1=pre, 2=regular, 3=after
+    "asia_session",    # 亚盘 (UTC 0-8)
+    "euro_session",    # 欧盘 (UTC 7-16)
+]
 
 # 全部信号特征
 SIGNAL_FEATURES = (
     BN_MOMENTUM + BN_VOLATILITY + BN_ADVANCED +
     CL_MOMENTUM + CL_VOLATILITY + CL_ADVANCED +
-    CROSS_SOURCE + PM_ORDERBOOK + WINDOW_CONTEXT
+    CROSS_SOURCE + PM_ORDERBOOK + WINDOW_CONTEXT + TIME_FEATURES
 )
 
 # 排除的特征 (持仓/累计/元数据 — 推理时不可用或会造成泄漏)

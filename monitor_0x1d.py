@@ -1928,6 +1928,20 @@ async def poll_0x1d_activity():
                                 # Burst 特征
                                 "burst_seq": burst_seq,
                                 "is_burst": is_burst,
+                                # ── 时间特征 (UTC) ──
+                                "hour_utc": datetime.fromtimestamp(ref_ts, tz=timezone.utc).hour,
+                                "minute_utc": datetime.fromtimestamp(ref_ts, tz=timezone.utc).minute,
+                                "day_of_week": datetime.fromtimestamp(ref_ts, tz=timezone.utc).weekday(),  # 0=Mon
+                                # 美股盘会话标记: pre=1, regular=2, after=3, closed=0
+                                "us_session": (
+                                    2 if 13*60+30 <= datetime.fromtimestamp(ref_ts, tz=timezone.utc).hour*60 + datetime.fromtimestamp(ref_ts, tz=timezone.utc).minute < 20*60
+                                    else (1 if 8*60 <= datetime.fromtimestamp(ref_ts, tz=timezone.utc).hour*60 + datetime.fromtimestamp(ref_ts, tz=timezone.utc).minute < 13*60+30
+                                    else (3 if 20*60 <= datetime.fromtimestamp(ref_ts, tz=timezone.utc).hour*60 + datetime.fromtimestamp(ref_ts, tz=timezone.utc).minute < 24*60
+                                    else 0))
+                                ),
+                                # 亚盘/欧盘/美盘连续标记
+                                "asia_session": 1 if 0 <= datetime.fromtimestamp(ref_ts, tz=timezone.utc).hour < 8 else 0,
+                                "euro_session": 1 if 7 <= datetime.fromtimestamp(ref_ts, tz=timezone.utc).hour < 16 else 0,
                             })
                             # 持久化到数据库
                             _db_save_trade_snap(
