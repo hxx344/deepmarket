@@ -295,6 +295,8 @@ class MonitorState:
 
         # 延迟结算
         self._pending_settle: dict | None = None    # {slug, question, end_ts, ptb, ...}
+        # RTDS 边界缓存: 0秒价格到达时保存, 供窗口切换时即时结算
+        self._rtds_boundary: dict | None = None     # {settle_price, old_ptb, obs_ts, at}
 
         # 动量快照 (BTC 行情 + 0x1d 下单关联)
         self.momentum_history: deque[dict] = deque(maxlen=MAX_BTC_HISTORY)
@@ -1153,49 +1155,22 @@ async def chainlink_rtds_stream():
                                 # 该价格同时是旧窗口的结算价 + 新窗口的开盘价
                                 obs_ts_int = int(obs_ts)
                                 if obs_ts_int % 300 == 0 and obs_ts_int > 0:
-                                    # ── 旧窗口即时结算 (RTDS 价格 vs PTB) ──
+                                    old_ptb = state.window_ptb
+
+                                    # ── 保存边界信息 (供窗口切换时即时结算) ──
+                                    # 必须在覆写 window_ptb 之前保存!
+                                    state._rtds_boundary = {
+                                        "settle_price": price,
+                                        "old_ptb": old_ptb,
+                                        "obs_ts": obs_ts_int,
+                                        "at": time.time(),
+                                    }
+
+                                    # ── 旧窗口即时结算 (如果 _pending_settle 已存在) ──
                                     if state._pending_settle:
-                                        ps = state._pending_settle
-                                        settle_price = price
-                                        ptb = ps["ptb"]
-                                        if ptb > 0:
-                                            won = "UP" if settle_price > ptb else "DOWN"
-                                        else:
-                                            won = "UP"
-                                        src = "RTDS"
-                                        total_cost = ps["cum_up_cost"] + ps["cum_dn_cost"]
-                                        if total_cost > 0:
-                                            payout = ps["cum_up_shares"] if won == "UP" else ps["cum_dn_shares"]
-                                            pnl = payout - total_cost
-                                            state.settled_windows.append({
-                                                "slug": ps["slug"],
-                                                "question": ps["question"],
-                                                "won": won,
-                                                "cost": round(total_cost, 2),
-                                                "payout": round(payout, 2),
-                                                "pnl": round(pnl, 2),
-                                                "trades": ps["trade_count"],
-                                                "ptb": round(ptb, 2),
-                                                "settle_price": round(settle_price, 2),
-                                                "settle_src": src,
-                                            })
-                                            if len(state.settled_windows) > 500:
-                                                state.settled_windows = state.settled_windows[-500:]
-                                            print(
-                                                f"[RTDS结算] {won} 赢 | PnL=${pnl:.2f} | "
-                                                f"结算价=${settle_price:,.2f} vs PTB=${ptb:,.2f} | "
-                                                f"来源={src}"
-                                            )
-                                            _db_save_settlement(state.settled_windows[-1])
-                                        else:
-                                            print(
-                                                f"[RTDS结算] 无交易 (cost=0), 跳过 | "
-                                                f"结算价=${settle_price:,.2f} vs PTB=${ptb:,.2f}"
-                                            )
-                                        state._pending_settle = None
+                                        _do_rtds_settle(price, state._pending_settle["ptb"])
 
                                     # ── 新窗口 PTB ──
-                                    old_ptb = state.window_ptb
                                     state.window_ptb = price
                                     state.ptb_source = "Chainlink obs"
                                     print(
@@ -1229,6 +1204,67 @@ async def chainlink_rtds_stream():
 #  数据采集: Polymarket 5-min 窗口发现 + 报价轮询
 # ─────────────────────────────────────────────────────────
 
+def _do_rtds_settle(settle_price: float, ptb: float):
+    """用 RTDS 价格即时结算 _pending_settle"""
+    ps = state._pending_settle
+    if not ps:
+        return
+    if ptb > 0:
+        won = "UP" if settle_price > ptb else "DOWN"
+    else:
+        won = "UP"
+    src = "RTDS"
+    total_cost = ps["cum_up_cost"] + ps["cum_dn_cost"]
+    if total_cost > 0:
+        payout = ps["cum_up_shares"] if won == "UP" else ps["cum_dn_shares"]
+        pnl = payout - total_cost
+        state.settled_windows.append({
+            "slug": ps["slug"],
+            "question": ps["question"],
+            "won": won,
+            "cost": round(total_cost, 2),
+            "payout": round(payout, 2),
+            "pnl": round(pnl, 2),
+            "trades": ps["trade_count"],
+            "ptb": round(ptb, 2),
+            "settle_price": round(settle_price, 2),
+            "settle_src": src,
+        })
+        if len(state.settled_windows) > 500:
+            state.settled_windows = state.settled_windows[-500:]
+        print(
+            f"[RTDS结算] {won} 赢 | PnL=${pnl:.2f} | "
+            f"结算价=${settle_price:,.2f} vs PTB=${ptb:,.2f} | "
+            f"来源={src}"
+        )
+        _db_save_settlement(state.settled_windows[-1])
+    else:
+        print(
+            f"[RTDS结算] 无交易 (cost=0), 跳过 | "
+            f"结算价=${settle_price:,.2f} vs PTB=${ptb:,.2f}"
+        )
+    state._pending_settle = None
+
+
+def _try_settle_from_boundary(ps: dict):
+    """创建 _pending_settle 后, 检查 RTDS 边界缓存是否可即时结算。
+    解决 RTDS 0秒价格先于窗口切换到达的时序竞争问题。"""
+    bd = state._rtds_boundary
+    if not bd:
+        return
+    # 边界信息必须新鲜 (< 30s) 且时间戳对应窗口结束
+    if time.time() - bd["at"] > 30:
+        return
+    if ps["end_ts"] and abs(bd["obs_ts"] - ps["end_ts"]) > 5:
+        return
+    # 用边界缓存的 old_ptb (不是被覆写后的 window_ptb)
+    settle_price = bd["settle_price"]
+    ptb = bd["old_ptb"]
+    print(f"[RTDS结算] 边界缓存命中: 结算价=${settle_price:,.2f} PTB=${ptb:,.2f} (延迟结算)")
+    _do_rtds_settle(settle_price, ptb)
+    state._rtds_boundary = None  # 用完清除
+
+
 def calc_window_ts() -> tuple[int, int, float]:
     """计算当前 5-min 窗口的起止时间戳"""
     now = time.time()
@@ -1250,11 +1286,13 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
     def _fallback_switch():
         """Gamma API 不可用/返回空时, 至少基于时间切换窗口slug"""
         if state.window_slug and state.trade_count_window > 0:
+            bd = state._rtds_boundary
+            saved_ptb = bd["old_ptb"] if (bd and time.time() - bd["at"] < 30) else state.window_ptb
             state._pending_settle = {
                 "slug": state.window_slug,
                 "question": state.window_question,
                 "end_ts": state.window_end_ts,
-                "ptb": state.window_ptb,
+                "ptb": saved_ptb,
                 "cum_up_shares": state.cum_up_shares,
                 "cum_dn_shares": state.cum_dn_shares,
                 "cum_up_cost": state.cum_up_cost,
@@ -1263,6 +1301,7 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
                 "end_up_price": state.up_price,
                 "end_dn_price": state.dn_price,
             }
+            _try_settle_from_boundary(state._pending_settle)
         state.window_slug = slug
         state.window_start_ts = ws
         state.window_end_ts = we
@@ -1314,13 +1353,15 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
             if up_idx < 0 or dn_idx < 0:
                 return False
 
-            # ── 旧窗口标记待结算 (等待 RTDS 下一个 0-秒价格即时结算) ──
+            # ── 旧窗口标记待结算 (优先用 RTDS 边界缓存即时结算) ──
             if state.window_slug and state.window_slug != slug:
+                bd = state._rtds_boundary
+                saved_ptb = bd["old_ptb"] if (bd and time.time() - bd["at"] < 30) else state.window_ptb
                 state._pending_settle = {
                     "slug": state.window_slug,
                     "question": state.window_question,
                     "end_ts": state.window_end_ts,
-                    "ptb": state.window_ptb,
+                    "ptb": saved_ptb,
                     "cum_up_shares": state.cum_up_shares,
                     "cum_dn_shares": state.cum_dn_shares,
                     "cum_up_cost": state.cum_up_cost,
@@ -1329,7 +1370,9 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
                     "end_up_price": state.up_price,
                     "end_dn_price": state.dn_price,
                 }
-                print(f"[PM] 旧窗口标记待结算 (等待 RTDS 0秒价格即时结算)")
+                _try_settle_from_boundary(state._pending_settle)
+                if state._pending_settle:
+                    print(f"[PM] 旧窗口标记待结算 (等待 RTDS 0秒价格)")
 
             state.window_slug = slug
             state.window_question = mkt.get("question", "")
@@ -1686,11 +1729,13 @@ async def poll_0x1d_activity():
                                         print(f"[Activity] ⚡ 检测到新窗口 (交易驱动切换): {slug}")
                                         # 保存旧窗口到 pending settle
                                         if state.window_slug and state.trade_count_window > 0:
+                                            bd = state._rtds_boundary
+                                            saved_ptb = bd["old_ptb"] if (bd and time.time() - bd["at"] < 30) else state.window_ptb
                                             state._pending_settle = {
                                                 "slug": state.window_slug,
                                                 "question": state.window_question,
                                                 "end_ts": state.window_end_ts,
-                                                "ptb": state.window_ptb,
+                                                "ptb": saved_ptb,
                                                 "cum_up_shares": state.cum_up_shares,
                                                 "cum_dn_shares": state.cum_dn_shares,
                                                 "cum_up_cost": state.cum_up_cost,
@@ -1699,6 +1744,7 @@ async def poll_0x1d_activity():
                                                 "end_up_price": state.up_price,
                                                 "end_dn_price": state.dn_price,
                                             }
+                                            _try_settle_from_boundary(state._pending_settle)
                                         # 切换到新窗口
                                         state.window_slug = slug
                                         state.window_start_ts = ts_from_slug
