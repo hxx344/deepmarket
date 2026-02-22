@@ -16,7 +16,6 @@ diskcache>=5.6
 
 # Technical Analysis
 ta>=0.11
-pandas-ta>=0.3
 
 # Polymarket
 py-clob-client>=0.15

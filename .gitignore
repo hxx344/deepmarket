@@ -33,7 +33,6 @@ Thumbs.db
 *.keyfile
 *.pem
 *.key
-config/settings.yaml
 
 # Temp / debug files
 _*.py

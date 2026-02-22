@@ -1,0 +1,133 @@
+# ============================
+# Polymarket BTC Predictor
+# Global Settings
+# ============================
+
+app:
+  name: "PM BTC 5min Predictor"
+  version: "0.1.0"
+  run_mode: "live"           # live / paper / backtest
+  trading_mode: "auto"       # auto / semi_auto / manual / paper
+
+# --- 数据存储 (方案B: 轻量级) ---
+storage:
+  data_dir: "data"
+  # Parquet: 行情时序数据
+  # SQLite:  业务数据 (data/pm_bot.db)
+  # diskcache: 实时缓存 (data/cache/)
+
+# --- 数据源 ---
+datasources:
+  chainlink:
+    # 连接模式:
+    #   auto    = PM RTDS → Data Streams → Binance → 链上 (推荐)
+    #   rtds    = 仅 PM RTDS WebSocket (免费 Chainlink 价格)
+    #   streams = 仅 Chainlink Data Streams API
+    #   binance = 仅 Binance 兜底
+    #   onchain = 仅链上 Price Feed
+    mode: "auto"
+    poll_interval: 2.0          # REST 轮询间隔 (秒)
+    # PM RTDS (免费! PM 转发的 Chainlink 价格, 无需 API key)
+    rtds_ws: "wss://ws-live-data.polymarket.com"
+    # Chainlink Data Streams API (可选, 与 PM 结算完全一致)
+    # 申请: https://chain.link/data-streams 或 https://pm-ds-request.streams.chain.link/
+    # 也可用环境变量: CHAINLINK_CLIENT_ID, CHAINLINK_CLIENT_SECRET
+    client_id: ""
+    client_secret: ""
+    # Binance 兜底 (RTDS 不可用时自动降级)
+    binance_ws: "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    binance_rest: "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+    # 链上 Price Feed (最后兜底)
+    polygon_rpc: "https://polygon-bor-rpc.publicnode.com"
+
+  polymarket:
+    enabled: true
+    market_ids: []            # 在运行时自动搜索活跃的 BTC 5min 市场
+    search_query: "Bitcoin"
+
+# --- 行情引擎 ---
+market:
+  max_klines: 1000            # 内存中保留的 K线条数
+  indicator_config: "config/indicators.yaml"
+  flush_interval: 300         # 数据持久化间隔 (秒)
+
+# --- 订单簿 ---
+orderbook:
+  snapshot_interval: 1.0      # 快照间隔 (秒)
+  large_order_threshold: 500  # 大单阈值 (USDC)
+  max_trade_history: 5000
+
+# --- 交易执行 ---
+trading:
+  fee_rate: 0.002             # 手续费率 (0.2%)
+  max_order_size: 500         # 单笔最大下注 (USDC)
+  default_bet_size: 50        # 默认下注金额
+  slippage_tolerance: 0.01    # 滑点容忍度
+  paper_latency_ms: 50        # 模拟盘延迟
+  paper_account:
+    initial_balance: 10000.0  # Paper 初始资金 (USDC)
+
+# --- 风控 ---
+risk:
+  rules_config: "config/risk_rules.yaml"
+  # Layer 1: 订单级
+  max_single_bet: 500         # USDC
+  max_orders_per_minute: 120
+  min_expected_return: 0.001  # 0.1%
+  # Layer 2: 策略级
+  max_strategy_daily_loss: -2000
+  max_consecutive_losses: 20
+  max_strategy_position: 10000
+  # Layer 3: 账户级
+  min_equity_ratio: 0.50      # 总资产不低于初始的 50%
+  max_daily_total_loss: -3000
+  max_total_exposure: 10000
+  # Layer 4: 熔断
+  breaker_cooldown: 60        # 秒
+
+# --- 告警 ---
+alerting:
+  console:
+    enabled: true
+  telegram:
+    enabled: false
+    bot_token: ""             # 从环境变量 TG_BOT_TOKEN 读取
+    chat_id: ""               # 从环境变量 TG_CHAT_ID 读取
+    min_level: "P1"
+  discord:
+    enabled: false
+    webhook_url: ""           # 从环境变量 DISCORD_WEBHOOK 读取
+    min_level: "P2"
+
+# --- 钱包 ---
+wallet:
+  read_only: true             # 只读模式 (不签名/不下单)
+  # 密钥从环境变量加载:
+  # PM_PRIVATE_KEY
+  # PM_WALLET_ADDRESS
+  polygon_rpc: "https://polygon-rpc.com"
+
+# --- 日志 ---
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  rotation: "10 MB"
+  retention: "30 days"
+
+# --- 回测 ---
+backtest:
+  data_dir: "data/polymarket"     # 历史数据缓存目录
+  default_balance: 1000           # USDC
+  fee_rate: 0.002
+  slippage_bps: 5
+  latency_ms: 100
+  interval: "5m"                  # K线周期
+  report_dir: "reports"
+
+  # Polymarket 数据源 (回测核心!)
+  # 获取方式: 运行 `python -m src.main backtest` 不带 token_id 会自动搜索并列出可用市场
+  token_id: ""                    # Polymarket YES/NO token ID
+  condition_id: ""                # Polymarket market condition ID
+  market_question: ""             # 市场问题 (可选, 用于报告标题)
+  start_date: "2024-01-01"       # 回测起始日
+  end_date: "2025-12-31"         # 回测结束日
