@@ -1,0 +1,26 @@
+# ============================
+# 策略配置: 订单流策略
+# ============================
+strategy:
+  name: "orderflow_5min"
+  module: src.strategy.templates.builtin
+  class: OrderFlowStrategy
+  enabled: false                 # 默认关闭, 需要 OrderBook 数据支持
+
+  params:
+    # CVD 参数
+    cvd_threshold: 100.0        # CVD 阈值
+    pressure_threshold: 0.6     # 盘口压力阈值 (0-1)
+
+    # 下注参数
+    bet_amount: 10.0
+    direction: "auto"
+
+  market_id: ""
+  interval: "5m"
+  cooldown_seconds: 300
+
+  constraints:
+    min_liquidity: 1000         # 订单流策略需要更高流动性
+    min_volume_24h: 2000
+    max_spread_pct: 3.0

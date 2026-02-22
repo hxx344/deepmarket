@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}回测中心{% endblock %}
+{% block page_title %}回测中心{% endblock %}
+
+{% block content %}
+<div class="space-y-6" x-data="backtestPage()" x-init="init()">
+
+  <!-- 回测说明 -->
+  <div class="card">
+    <h3 class="text-sm font-semibold text-gray-300 mb-2">使用说明</h3>
+    <p class="text-sm text-gray-400">
+      通过命令行执行回测: <code class="text-brand-500 bg-surface-3 px-2 py-0.5 rounded">python -m src.main backtest</code>
+      <br>回测报告 (HTML) 自动保存到 <code class="text-brand-500 bg-surface-3 px-2 py-0.5 rounded">reports/</code> 目录
+    </p>
+  </div>
+
+  <!-- 报告列表 -->
+  <div class="card">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="text-sm font-semibold text-gray-300">回测报告</h3>
+      <button class="btn btn-outline text-xs" @click="load()">刷新</button>
+    </div>
+
+    <template x-if="reports.length === 0">
+      <div class="text-center py-12 text-gray-500">
+        <svg class="w-12 h-12 mx-auto mb-3 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>
+        <p class="text-lg mb-2">暂无回测报告</p>
+        <p class="text-sm">运行回测后报告将显示在这里</p>
+      </div>
+    </template>
+
+    <div class="space-y-2">
+      <template x-for="r in reports" :key="r.name">
+        <div class="bg-surface-3 rounded-lg p-4 flex items-center justify-between hover:bg-gray-700/50 transition-colors">
+          <div>
+            <p class="font-medium text-white" x-text="r.name"></p>
+            <p class="text-xs text-gray-500 mt-0.5">
+              <span x-text="new Date(r.modified * 1000).toLocaleString('zh-CN')"></span>
+              <span class="mx-1">·</span>
+              <span x-text="(r.size / 1024).toFixed(0) + ' KB'"></span>
+            </p>
+          </div>
+          <a :href="r.url" target="_blank" class="btn btn-primary text-xs">查看报告</a>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function backtestPage() {
+  return {
+    reports: [],
+    async init() { await this.load(); },
+    async load() {
+      try {
+        const resp = await fetch('/api/v1/backtest/reports');
+        const data = await resp.json();
+        this.reports = data.reports || [];
+      } catch (e) {}
+    },
+  };
+}
+</script>
+{% endblock %}

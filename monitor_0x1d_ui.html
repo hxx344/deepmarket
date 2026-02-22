@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>0x1d 实时监控面板</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --up-color: #3fb950; --dn-color: #f85149;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', -apple-system, sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh;
+  }
+
+  /* ── Header ── */
+  .header {
+    background: var(--card); border-bottom: 1px solid var(--border);
+    padding: 12px 24px; display: flex; align-items: center; gap: 20px;
+  }
+  .header h1 { font-size: 18px; color: var(--accent); }
+  .status-dots { display: flex; gap: 12px; margin-left: auto; }
+  .dot {
+    display: flex; align-items: center; gap: 4px;
+    font-size: 12px; color: var(--muted);
+  }
+  .dot::before {
+    content: ''; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--red);
+  }
+  .dot.ok::before { background: var(--green); }
+
+  /* ── Grid Layout ── */
+  .grid {
+    display: grid; padding: 16px;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto auto auto;
+    gap: 16px;
+  }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+  }
+  .card-title {
+    font-size: 13px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 12px; font-weight: 600;
+  }
+
+  /* ── 窗口状态栏 ── */
+  .window-bar {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+  }
+  .window-bar .label { color: var(--muted); font-size: 12px; }
+  .window-bar .value { font-size: 20px; font-weight: 700; }
+  .window-bar .value.up { color: var(--green); }
+  .window-bar .value.dn { color: var(--red); }
+  .progress-bar {
+    flex: 1; min-width: 200px; height: 6px;
+    background: var(--border); border-radius: 3px; overflow: hidden;
+  }
+  .progress-bar .fill {
+    height: 100%; background: var(--accent); border-radius: 3px;
+    transition: width 1s linear;
+  }
+
+  /* ── 指标格子 ── */
+  .metrics {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 12px;
+  }
+  .metric { text-align: center; }
+  .metric .val { font-size: 22px; font-weight: 700; }
+  .metric .lbl { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .metric .val.green { color: var(--green); }
+  .metric .val.red { color: var(--red); }
+  .metric .val.yellow { color: var(--yellow); }
+
+  /* ── Chart 容器 ── */
+  .chart-wrap { position: relative; height: 220px; }
+  .chart-wrap canvas { width: 100% !important; height: 100% !important; }
+
+  /* ── 交易表 ── */
+  .trade-log { grid-column: 1 / -1; }
+  .trade-table {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+  }
+  .trade-table th {
+    text-align: left; color: var(--muted); font-weight: 600;
+    padding: 6px 8px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--card);
+  }
+  .trade-table td {
+    padding: 4px 8px; border-bottom: 1px solid #21262d;
+    font-variant-numeric: tabular-nums;
+  }
+  .trade-table tr:hover { background: #1c2128; }
+  .trade-table .up { color: var(--green); }
+  .trade-table .dn { color: var(--red); }
+  .trade-scroll {
+    max-height: 260px; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+
+  /* ── Burst 事件 ── */
+  .burst-tag {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 600;
+    background: rgba(210, 153, 34, 0.15); color: var(--yellow);
+    margin: 2px;
+  }
+
+  /* ── PnL 卡片 ── */
+  .pnl-big {
+    font-size: 32px; font-weight: 800; text-align: center; margin: 8px 0 4px;
+  }
+  .pnl-big.positive { color: var(--green); }
+  .pnl-big.negative { color: var(--red); }
+  .pnl-big.zero { color: var(--muted); }
+  .pnl-sub { text-align: center; font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+  .pnl-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+    margin-bottom: 12px;
+  }
+  .pnl-cell {
+    background: rgba(255,255,255,0.03); border-radius: 6px;
+    padding: 8px 12px; text-align: center;
+  }
+  .pnl-cell .pnl-val { font-size: 18px; font-weight: 700; }
+  .pnl-cell .pnl-lbl { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .settled-item {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 4px 8px; border-bottom: 1px solid #21262d; font-size: 11px;
+  }
+  .settled-item:last-child { border-bottom: none; }
+  .settled-scroll { max-height: 130px; overflow-y: auto; scrollbar-width: thin; }
+
+  /* ── 底部 ── */
+  .footer {
+    text-align: center; color: var(--muted); font-size: 11px;
+    padding: 12px; border-top: 1px solid var(--border);
+  }
+</style>
+</head>
+<body>
+
+<!-- ════════ Header ════════ -->
+<div class="header">
+  <h1>🔍 0x1d 实时监控面板</h1>
+  <span style="color:var(--muted);font-size:12px" id="clock">--:--:--</span>
+  <div class="status-dots">
+    <span class="dot" id="dot-rtds">Chainlink</span>
+    <span class="dot" id="dot-bn">Binance</span>
+    <span class="dot" id="dot-pm">Polymarket</span>
+    <span class="dot" id="dot-act">Activity</span>
+  </div>
+</div>
+
+<!-- ════════ Main Grid ════════ -->
+<div class="grid">
+
+  <!-- ── 窗口状态 ── -->
+  <div class="card window-bar">
+    <div>
+      <div class="label">当前窗口</div>
+      <div class="value" id="window-name" style="font-size:14px;color:var(--accent)">等待连接...</div>
+    </div>
+    <div>
+      <div class="label">基准价 (PTB)</div>
+      <div class="value" id="ptb-val">--</div>
+      <div style="font-size:10px;color:#888" id="ptb-source"></div>
+    </div>
+    <div>
+      <div class="label">BTC 当前</div>
+      <div class="value" id="btc-val">--</div>
+      <div style="font-size:10px;color:#888" id="btc-source"></div>
+    </div>
+    <div>
+      <div class="label">BTC 方向</div>
+      <div class="value" id="btc-dir">--</div>
+    </div>
+    <div>
+      <div class="label">剩余</div>
+      <div class="value" id="secs-left">--</div>
+    </div>
+    <div style="flex:1;min-width:200px">
+      <div class="label">窗口进度</div>
+      <div class="progress-bar"><div class="fill" id="progress-fill" style="width:0%"></div></div>
+    </div>
+  </div>
+
+  <!-- ── 左上: PM 报价 + Edge ── -->
+  <div class="card">
+    <div class="card-title">Polymarket 报价</div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="val green" id="up-price">--</div>
+        <div class="lbl">UP Price</div>
+      </div>
+      <div class="metric">
+        <div class="val red" id="dn-price">--</div>
+        <div class="lbl">DOWN Price</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="combined">--</div>
+        <div class="lbl">UP + DOWN</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="edge-val">--</div>
+        <div class="lbl">Edge</div>
+      </div>
+      <div class="metric">
+        <div class="val green" id="up-bid-ask">--</div>
+        <div class="lbl">UP Bid/Ask</div>
+      </div>
+      <div class="metric">
+        <div class="val red" id="dn-bid-ask">--</div>
+        <div class="lbl">DN Bid/Ask</div>
+      </div>
+    </div>
+    <div class="chart-wrap" style="margin-top:12px;height:160px">
+      <canvas id="chart-pm"></canvas>
+    </div>
+  </div>
+
+  <!-- ── 右上: BTC 价格 + 动量 ── -->
+  <div class="card">
+    <div class="card-title">BTC 行情对比 (<span id="chart-btc-source" style="color:#58a6ff">---</span>)</div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="val" id="btc-price-big">--</div>
+        <div class="lbl">BTC Price</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="mom-1s-val">--</div>
+        <div class="lbl">1s 动量</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="mom-3s-val">--</div>
+        <div class="lbl">3s 动量</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="momentum-val">--</div>
+        <div class="lbl">5s 动量</div>
+      </div>
+    </div>
+    <div class="chart-wrap" style="margin-top:12px;height:220px">
+      <canvas id="chart-btc"></canvas>
+    </div>
+  </div>
+
+  <!-- ── 左下: 0x1d 持仓 ── -->
+  <div class="card">
+    <div class="card-title">0x1d 当前窗口持仓</div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="val green" id="up-shares">0</div>
+        <div class="lbl">UP Shares</div>
+      </div>
+      <div class="metric">
+        <div class="val red" id="dn-shares">0</div>
+        <div class="lbl">DN Shares</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="gap-val">0</div>
+        <div class="lbl">Gap (sh)</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="gap-pct">0%</div>
+        <div class="lbl">Gap %</div>
+      </div>
+      <div class="metric">
+        <div class="val yellow" id="trade-cnt">0</div>
+        <div class="lbl">订单数</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="total-cost">$0</div>
+        <div class="lbl">总投入</div>
+      </div>
+    </div>
+    <div class="chart-wrap" style="margin-top:12px;height:160px">
+      <canvas id="chart-shares"></canvas>
+    </div>
+  </div>
+
+  <!-- ── 右下: Burst 检测 ── -->
+  <div class="card">
+    <div class="card-title">Burst 检测 & 入场节奏</div>
+    <div id="burst-list" style="min-height:40px;margin-bottom:8px">
+      <span style="color:var(--muted);font-size:12px">等待 burst 事件...</span>
+    </div>
+    <div class="chart-wrap" style="height:180px">
+      <canvas id="chart-timeline"></canvas>
+    </div>
+  </div>
+
+  <!-- ── 盈亏分析 (跨两列) ── -->
+  <div class="card" style="grid-column: 1 / 2;">
+    <div class="card-title">💰 持仓盈亏 (当前窗口)</div>
+    <!-- 大字 PnL -->
+    <div class="pnl-big zero" id="pnl-expected-big">$0.00</div>
+    <div class="pnl-sub" id="pnl-expected-label">预期 PnL (等待方向)</div>
+
+    <div class="pnl-grid">
+      <div class="pnl-cell">
+        <div class="pnl-val" id="pnl-mtm" style="color:var(--accent)">$0.00</div>
+        <div class="pnl-lbl">MTM 估值</div>
+      </div>
+      <div class="pnl-cell">
+        <div class="pnl-val" id="pnl-mtm-pct" style="color:var(--accent)">0%</div>
+        <div class="pnl-lbl">MTM ROI</div>
+      </div>
+      <div class="pnl-cell">
+        <div class="pnl-val" style="color:var(--green)" id="pnl-if-up">$0.00</div>
+        <div class="pnl-lbl">若 UP 赢</div>
+      </div>
+      <div class="pnl-cell">
+        <div class="pnl-val" style="color:var(--red)" id="pnl-if-dn">$0.00</div>
+        <div class="pnl-lbl">若 DN 赢</div>
+      </div>
+      <div class="pnl-cell">
+        <div class="pnl-val" style="color:var(--green)" id="avg-up-price">--</div>
+        <div class="pnl-lbl">UP 均价</div>
+      </div>
+      <div class="pnl-cell">
+        <div class="pnl-val" style="color:var(--red)" id="avg-dn-price">--</div>
+        <div class="pnl-lbl">DN 均价</div>
+      </div>
+    </div>
+
+    <div class="chart-wrap" style="height:120px;">
+      <canvas id="chart-pnl"></canvas>
+    </div>
+  </div>
+
+  <!-- ── 历史结算 ── -->
+  <div class="card" style="grid-column: 2 / 3;">
+    <div class="card-title">📊 历史窗口结算</div>
+    <div class="metrics" style="margin-bottom:12px">
+      <div class="metric">
+        <div class="val" id="settled-pnl">$0</div>
+        <div class="lbl">累计 PnL</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="settled-wins">0/0</div>
+        <div class="lbl">胜场/总场</div>
+      </div>
+      <div class="metric">
+        <div class="val" id="settled-wr">--%</div>
+        <div class="lbl">胜率</div>
+      </div>
+    </div>
+    <div class="settled-scroll" id="settled-list">
+      <div style="color:var(--muted);font-size:12px;padding:8px">等待首个窗口结算...</div>
+    </div>
+  </div>
+
+  <!-- ── 策略逆向: 多特征关联分析 (跨两列) ── -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <div class="card-title">🔬 策略逆向 — 多特征关联度排行</div>
+    <div style="margin-bottom:8px;font-size:11px;color:var(--muted)">
+      每笔 0x1d 交易采集 20+ 特征，实时计算 side(UP=+1,DN=-1) 与各特征的 Pearson r，按 |r| 降序排列。
+      <span style="color:var(--green)">■</span>正相关(顺势) <span style="color:var(--red)">■</span>负相关(逆势)
+    </div>
+    <!-- 特征排行表格 -->
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+      <!-- 当前窗口 -->
+      <div style="flex:1;min-width:340px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 14px;max-height:320px;overflow-y:auto">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px">
+          📊 当前窗口 (n=<span id="fc-w-n">0</span>) | 最强: <span id="fc-w-best" style="color:#d29922;font-weight:700">--</span>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:11px" id="fc-w-table">
+          <thead>
+            <tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+              <th style="text-align:left;padding:2px 4px;width:24px">#</th>
+              <th style="text-align:left;padding:2px 4px">特征</th>
+              <th style="text-align:left;padding:2px 4px;width:40px">类别</th>
+              <th style="text-align:right;padding:2px 4px;width:60px">r</th>
+              <th style="text-align:left;padding:2px 4px;width:100px">|r|</th>
+              <th style="text-align:right;padding:2px 4px;width:45px">一致%</th>
+            </tr>
+          </thead>
+          <tbody id="fc-w-body"></tbody>
+        </table>
+      </div>
+      <!-- 全局累积 -->
+      <div style="flex:1;min-width:340px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 14px;max-height:320px;overflow-y:auto">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px">
+          📊 全局累积 (n=<span id="fc-g-n">0</span>) | 最强: <span id="fc-g-best" style="color:#d29922;font-weight:700">--</span>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:11px" id="fc-g-table">
+          <thead>
+            <tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+              <th style="text-align:left;padding:2px 4px;width:24px">#</th>
+              <th style="text-align:left;padding:2px 4px">特征</th>
+              <th style="text-align:left;padding:2px 4px;width:40px">类别</th>
+              <th style="text-align:right;padding:2px 4px;width:60px">r</th>
+              <th style="text-align:left;padding:2px 4px;width:100px">|r|</th>
+              <th style="text-align:right;padding:2px 4px;width:45px">一致%</th>
+            </tr>
+          </thead>
+          <tbody id="fc-g-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <!-- 关联图 (保留) -->
+    <div style="margin-bottom:6px;font-size:10px;color:var(--muted)">
+      X轴=窗口秒数 | 曲线=BTC动量 | 散点=0x1d下单 |
+      <span style="color:#3fb950">●UP</span> <span style="color:#f85149">●DN</span>
+    </div>
+    <div class="chart-wrap" style="height:280px">
+      <canvas id="chart-correlation"></canvas>
+    </div>
+  </div>
+
+  <!-- ── 底部: 交易流水 ── -->
+  <div class="card trade-log">
+    <div class="card-title">0x1d 最近交易 (当前窗口)</div>
+    <div class="trade-scroll">
+      <table class="trade-table">
+        <thead>
+          <tr>
+            <th>#</th><th>时间</th><th>方向</th><th>Shares</th>
+            <th>Price</th><th>USDC</th><th>CumUP</th><th>CumDN</th><th>Gap</th>
+          </tr>
+        </thead>
+        <tbody id="trade-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<div class="footer">
+  0x1d Monitor | Polymarket BTC 5-min | WebSocket 实时推送 | 数据延迟 ~3s
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════
+//  Chart.js 初始化
+// ═══════════════════════════════════════════════════
+
+const chartDefaults = {
+  responsive: true, maintainAspectRatio: false,
+  animation: { duration: 0 },
+  scales: {
+    x: { display: false },
+    y: { ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#21262d' } }
+  },
+  plugins: { legend: { display: false } }
+};
+
+// BTC Chart (多线对比: Chainlink RTDS + Binance + PTB + 入场点)
+const ctxBtc = document.getElementById('chart-btc').getContext('2d');
+const chartBtc = new Chart(ctxBtc, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [{
+      label: 'Chainlink', data: [], borderColor: '#58a6ff', borderWidth: 1.5,
+      pointRadius: 0, tension: 0.1, fill: false, order: 2
+    }, {
+      label: 'Binance', data: [], borderColor: '#8b949e', borderWidth: 1,
+      pointRadius: 0, tension: 0.1, fill: false, order: 3
+    }, {
+      label: 'PTB', data: [], borderColor: '#d29922', borderWidth: 1,
+      borderDash: [4,4], pointRadius: 0, fill: false, order: 4
+    }, {
+      label: 'UP入场', data: [], type: 'scatter',
+      backgroundColor: '#3fb950', borderColor: '#3fb950',
+      pointRadius: 5, pointStyle: 'triangle', showLine: false, order: 1
+    }, {
+      label: 'DN入场', data: [], type: 'scatter',
+      backgroundColor: '#f85149', borderColor: '#f85149',
+      pointRadius: 5, pointStyle: 'triangle', rotation: 180, showLine: false, order: 1
+    }]
+  },
+  options: { ...chartDefaults,
+    scales: {
+      x: { type: 'linear', display: false },
+      y: { ...chartDefaults.scales.y,
+        ticks: { ...chartDefaults.scales.y.ticks, callback: v => '$'+v.toLocaleString() }
+      }
+    },
+    plugins: {
+      legend: { display: true, labels: { color: '#8b949e', boxWidth: 10, font: { size: 10 } } },
+      tooltip: {
+        callbacks: {
+          label: (ctx) => {
+            const ds = ctx.dataset.label;
+            if (ds === 'UP入场' || ds === 'DN入场') {
+              return ds + ': $' + (ctx.parsed.y||0).toLocaleString();
+            }
+            return ds + ': $' + (ctx.parsed.y||0).toLocaleString();
+          }
+        }
+      }
+    }
+  }
+});
+
+// PM Price Chart
+const ctxPm = document.getElementById('chart-pm').getContext('2d');
+const chartPm = new Chart(ctxPm, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [{
+      label: 'UP', data: [], borderColor: '#3fb950', borderWidth: 1.5,
+      pointRadius: 0, tension: 0.1, fill: false
+    }, {
+      label: 'DN', data: [], borderColor: '#f85149', borderWidth: 1.5,
+      pointRadius: 0, tension: 0.1, fill: false
+    }, {
+      label: 'Edge', data: [], borderColor: '#d29922', borderWidth: 1,
+      borderDash: [3,3], pointRadius: 0, fill: false, yAxisID: 'y1'
+    }]
+  },
+  options: { ...chartDefaults,
+    scales: { ...chartDefaults.scales,
+      y1: {
+        position: 'right', grid: { drawOnChartArea: false },
+        ticks: { color: '#d29922', font: { size: 10 }, callback: v => (v*100).toFixed(1)+'%' }
+      }
+    },
+    plugins: {
+      legend: { display: true, labels: { color: '#8b949e', boxWidth: 12, font: { size: 10 } } }
+    }
+  }
+});
+
+// Shares Chart
+const ctxShares = document.getElementById('chart-shares').getContext('2d');
+const chartShares = new Chart(ctxShares, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [{
+      label: 'UP累计', data: [], borderColor: '#3fb950', borderWidth: 2,
+      pointRadius: 0, tension: 0, fill: false
+    }, {
+      label: 'DN累计', data: [], borderColor: '#f85149', borderWidth: 2,
+      pointRadius: 0, tension: 0, fill: false
+    }]
+  },
+  options: { ...chartDefaults,
+    plugins: {
+      legend: { display: true, labels: { color: '#8b949e', boxWidth: 12, font: { size: 10 } } }
+    }
+  }
+});
+
+// Timeline (scatter: 每笔交易的时间分布)
+const ctxTl = document.getElementById('chart-timeline').getContext('2d');
+const chartTimeline = new Chart(ctxTl, {
+  type: 'scatter',
+  data: {
+    datasets: [{
+      label: 'UP', data: [], backgroundColor: 'rgba(63,185,80,0.6)',
+      pointRadius: 4, pointHoverRadius: 6
+    }, {
+      label: 'DN', data: [], backgroundColor: 'rgba(248,81,73,0.6)',
+      pointRadius: 4, pointHoverRadius: 6
+    }]
+  },
+  options: { ...chartDefaults,
+    scales: {
+      x: {
+        display: true, title: { display: true, text: '窗口内秒数', color: '#8b949e', font: { size: 10 } },
+        min: 0, max: 300,
+        ticks: { color: '#8b949e', font: { size: 9 } },
+        grid: { color: '#21262d' }
+      },
+      y: {
+        title: { display: true, text: 'Shares', color: '#8b949e', font: { size: 10 } },
+        ticks: { color: '#8b949e', font: { size: 9 } },
+        grid: { color: '#21262d' }
+      }
+    },
+    plugins: {
+      legend: { display: true, labels: { color: '#8b949e', boxWidth: 12, font: { size: 10 } } }
+    }
+  }
+});
+
+// PnL Chart
+const ctxPnl = document.getElementById('chart-pnl').getContext('2d');
+const chartPnl = new Chart(ctxPnl, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [{
+      label: 'MTM PnL', data: [], borderColor: '#58a6ff', borderWidth: 1.5,
+      pointRadius: 0, tension: 0.2, fill: true,
+      backgroundColor: 'rgba(88,166,255,0.08)'
+    }, {
+      label: '预期 PnL', data: [], borderColor: '#d29922', borderWidth: 1,
+      borderDash: [3,3], pointRadius: 0, tension: 0.2, fill: false
+    }]
+  },
+  options: { ...chartDefaults,
+    scales: { ...chartDefaults.scales,
+      y: { ...chartDefaults.scales.y,
+        ticks: { ...chartDefaults.scales.y.ticks, callback: v => '$'+v.toFixed(0) }
+      }
+    },
+    plugins: {
+      legend: { display: true, labels: { color: '#8b949e', boxWidth: 12, font: { size: 10 } } }
+    }
+  }
+});
+
+// Correlation Chart — 下单时机 × BTC 动量
+const ctxCorr = document.getElementById('chart-correlation').getContext('2d');
+const chartCorr = new Chart(ctxCorr, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      // 动量曲线
+      {
+        label: '1s动量', data: [], borderColor: 'rgba(88,166,255,0.4)', borderWidth: 1,
+        pointRadius: 0, tension: 0.3, fill: false, yAxisID: 'yMom', order: 3
+      },
+      {
+        label: '3s动量', data: [], borderColor: 'rgba(88,166,255,0.7)', borderWidth: 1.5,
+        pointRadius: 0, tension: 0.3, fill: false, yAxisID: 'yMom', order: 2
+      },
+      {
+        label: '5s动量', data: [], borderColor: '#58a6ff', borderWidth: 2,
+        pointRadius: 0, tension: 0.3, fill: true,
+        backgroundColor: 'rgba(88,166,255,0.06)', yAxisID: 'yMom', order: 1
+      },
+      // 0x1d 下单散点 (UP)
+      {
+        label: 'UP下单', type: 'scatter', data: [],
+        backgroundColor: 'rgba(63,185,80,0.8)',
+        pointRadius: 5, pointHoverRadius: 8,
+        yAxisID: 'yMom', order: 0
+      },
+      // 0x1d 下单散点 (DN)
+      {
+        label: 'DN下单', type: 'scatter', data: [],
+        backgroundColor: 'rgba(248,81,73,0.8)',
+        pointRadius: 5, pointHoverRadius: 8,
+        yAxisID: 'yMom', order: 0
+      },
+    ]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    animation: { duration: 0 },
+    interaction: { mode: 'nearest', intersect: false },
+    scales: {
+      x: {
+        display: true,
+        title: { display: true, text: '窗口内秒数', color: '#8b949e', font: { size: 10 } },
+        min: 0, max: 300,
+        ticks: { color: '#8b949e', font: { size: 9 }, stepSize: 30 },
+        grid: { color: '#21262d' }
+      },
+      yMom: {
+        display: true, position: 'left',
+        title: { display: true, text: 'BTC 动量 ($)', color: '#58a6ff', font: { size: 10 } },
+        ticks: { color: '#58a6ff', font: { size: 9 }, callback: v => '$'+v.toFixed(0) },
+        grid: { color: '#21262d' }
+      }
+    },
+    plugins: {
+      legend: { display: true, labels: { color: '#8b949e', boxWidth: 12, font: { size: 10 } } },
+      tooltip: {
+        callbacks: {
+          label: function(ctx) {
+            if (ctx.datasetIndex >= 3) {
+              // 散点
+              const p = ctx.raw;
+              return `${ctx.dataset.label}: ${p.y >= 0 ? '+' : ''}$${p.y.toFixed(1)} (${p.shares}sh @ ${p.elapsed}s)`;
+            }
+            return `${ctx.dataset.label}: $${ctx.parsed.y.toFixed(2)}`;
+          }
+        }
+      }
+    }
+  }
+});
+
+
+// ═══════════════════════════════════════════════════
+//  WebSocket 连接
+// ═══════════════════════════════════════════════════
+
+let ws = null;
+let sharesHistory = [];  // 用于 shares 走势
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => console.log('WS connected');
+  ws.onclose = () => { console.log('WS disconnected'); setTimeout(connectWS, 2000); };
+  ws.onerror = (e) => console.error('WS error', e);
+  ws.onmessage = (e) => {
+    try { updateUI(JSON.parse(e.data)); }
+    catch(err) { console.error('Parse error', err); }
+  };
+}
+
+function updateUI(d) {
+  // Clock
+  document.getElementById('clock').textContent = d.time || '--:--:--';
+
+  // Status dots
+  document.getElementById('dot-rtds').className = 'dot' + (d.rtds_ok ? ' ok' : '');
+  document.getElementById('dot-bn').className = 'dot' + (d.binance_ok ? ' ok' : '');
+  document.getElementById('dot-pm').className = 'dot' + (d.pm_ok ? ' ok' : '');
+  document.getElementById('dot-act').className = 'dot' + (d.activity_ok ? ' ok' : '');
+
+  // Window
+  document.getElementById('window-name').textContent = d.window_question || '等待窗口...';
+  document.getElementById('ptb-val').textContent = d.window_ptb ? '$'+d.window_ptb.toLocaleString() : '--';
+  document.getElementById('ptb-source').textContent = d.ptb_source || '';
+  document.getElementById('btc-val').textContent = d.btc_price ? '$'+d.btc_price.toLocaleString() : '--';
+  document.getElementById('btc-source').textContent = d.btc_source || '';
+  document.getElementById('secs-left').textContent = d.secs_left != null ? d.secs_left + 's' : '--';
+  document.getElementById('progress-fill').style.width = (d.window_progress_pct || 0) + '%';
+
+  // BTC direction
+  const dir = d.btc_price && d.window_ptb ? (d.btc_price > d.window_ptb ? '↑ UP' : '↓ DN') : '--';
+  const dirEl = document.getElementById('btc-dir');
+  dirEl.textContent = dir;
+  dirEl.className = 'value ' + (dir.includes('UP') ? 'up' : dir.includes('DN') ? 'dn' : '');
+
+  // PM prices
+  document.getElementById('up-price').textContent = d.up_price ? d.up_price.toFixed(4) : '--';
+  document.getElementById('dn-price').textContent = d.dn_price ? d.dn_price.toFixed(4) : '--';
+  document.getElementById('combined').textContent = d.combined_price ? d.combined_price.toFixed(4) : '--';
+  const edgeEl = document.getElementById('edge-val');
+  if (d.edge != null) {
+    edgeEl.textContent = (d.edge >= 0 ? '+' : '') + (d.edge * 100).toFixed(2) + '%';
+    edgeEl.className = 'val ' + (d.edge >= 0 ? 'green' : 'red');
+  }
+  document.getElementById('up-bid-ask').textContent =
+    d.up_bid ? d.up_bid.toFixed(2) + '/' + d.up_ask.toFixed(2) : '--';
+  document.getElementById('dn-bid-ask').textContent =
+    d.dn_bid ? d.dn_bid.toFixed(2) + '/' + d.dn_ask.toFixed(2) : '--';
+
+  // BTC big price
+  document.getElementById('btc-price-big').textContent = d.btc_price ? '$'+d.btc_price.toLocaleString() : '--';
+  const momEl = document.getElementById('momentum-val');
+  if (d.btc_momentum != null) {
+    momEl.textContent = (d.btc_momentum >= 0 ? '+' : '') + '$' + d.btc_momentum.toFixed(2);
+    momEl.className = 'val ' + (d.btc_momentum >= 0 ? 'green' : 'red');
+  }
+  // 1s / 3s 动量
+  const mom1El = document.getElementById('mom-1s-val');
+  if (mom1El && d.btc_momentum_1s != null) {
+    mom1El.textContent = (d.btc_momentum_1s >= 0 ? '+' : '') + '$' + d.btc_momentum_1s.toFixed(2);
+    mom1El.className = 'val ' + (d.btc_momentum_1s >= 0 ? 'green' : 'red');
+  }
+  const mom3El = document.getElementById('mom-3s-val');
+  if (mom3El && d.btc_momentum_3s != null) {
+    mom3El.textContent = (d.btc_momentum_3s >= 0 ? '+' : '') + '$' + d.btc_momentum_3s.toFixed(2);
+    mom3El.className = 'val ' + (d.btc_momentum_3s >= 0 ? 'green' : 'red');
+  }
+
+  // 0x1d holdings
+  document.getElementById('up-shares').textContent = d.cum_up_shares || 0;
+  document.getElementById('dn-shares').textContent = d.cum_dn_shares || 0;
+  document.getElementById('gap-val').textContent = (d.gap_shares >= 0 ? '+' : '') + d.gap_shares;
+  const gapPctEl = document.getElementById('gap-pct');
+  gapPctEl.textContent = Math.abs(d.gap_pct || 0).toFixed(1) + '%';
+  gapPctEl.className = 'val ' + (Math.abs(d.gap_pct) > 10 ? 'yellow' : 'green');
+  document.getElementById('trade-cnt').textContent = d.trade_count || 0;
+  document.getElementById('total-cost').textContent = '$' + (d.total_cost || 0).toLocaleString();
+
+  // ── Charts ──
+  // BTC chart (多线对比)
+  if (d.btc_history && d.btc_history.length > 0) {
+    // X 轴用时间戳 (数值型, 所有数据统一坐标)
+    const rtdsData = d.btc_history.map(h => ({x: h.ts, y: h.price}));
+    const bnData = (d.bn_history||[]).map(h => ({x: h.ts, y: h.price}));
+    const ptbData = d.btc_history.map(h => ({x: h.ts, y: d.window_ptb || null}));
+
+    // 入场点: 从 trades 提取, 优先使用 CLOB 链下撮合时间戳
+    const upEntries = [], dnEntries = [];
+    if (d.trades) {
+      for (const t of d.trades) {
+        // 优先 ts_clob (链下撮合时间), 回退 ts (上链时间)
+        const entryTs = t.ts_clob || t.ts;
+        if (!entryTs) continue;
+        // 查找最接近该时间的 BTC 价格
+        let btcAtTrade = d.btc_price;
+        let bestDiff = Infinity;
+        for (const h of d.btc_history) {
+          const diff = Math.abs(h.ts - entryTs);
+          if (diff < bestDiff) { bestDiff = diff; btcAtTrade = h.price; }
+        }
+        const pt = {x: entryTs, y: btcAtTrade};
+        if (t.side === 'UP') upEntries.push(pt);
+        else dnEntries.push(pt);
+      }
+    }
+
+    chartBtc.data.datasets[0].data = rtdsData;
+    chartBtc.data.datasets[1].data = bnData;
+    chartBtc.data.datasets[2].data = ptbData;
+    chartBtc.data.datasets[3].data = upEntries;
+    chartBtc.data.datasets[4].data = dnEntries;
+    chartBtc.update('none');
+  }
+
+  // 更新价格源标签
+  document.getElementById('chart-btc-source').textContent = d.btc_source || '---';
+
+  // PM chart
+  if (d.pm_price_history && d.pm_price_history.length > 0) {
+    chartPm.data.labels = d.pm_price_history.map(h => '');
+    chartPm.data.datasets[0].data = d.pm_price_history.map(h => h.up);
+    chartPm.data.datasets[1].data = d.pm_price_history.map(h => h.dn);
+    chartPm.data.datasets[2].data = d.pm_price_history.map(h => h.edge);
+    chartPm.update('none');
+  }
+
+  // Shares chart (累积)
+  if (d.trades && d.trades.length > 0) {
+    let cumUp = 0, cumDn = 0;
+    const labels = [], upData = [], dnData = [];
+    for (const t of d.trades) {
+      if (t.side === 'UP') cumUp += t.shares;
+      else cumDn += t.shares;
+      labels.push(t.time || '');
+      upData.push(cumUp);
+      dnData.push(cumDn);
+    }
+    chartShares.data.labels = labels;
+    chartShares.data.datasets[0].data = upData;
+    chartShares.data.datasets[1].data = dnData;
+    chartShares.update('none');
+  }
+
+  // Timeline scatter
+  if (d.trades && d.trades.length > 0) {
+    const upPts = [], dnPts = [];
+    for (const t of d.trades) {
+      // 估算窗口内秒数: 用 trade 的 time 字段解析
+      const elapsed = d.window_elapsed || 0;
+      // 简单方式: 用交易序号近似分布
+      const idx = d.trades.indexOf(t);
+      const x = elapsed > 0 ? elapsed * (idx / d.trades.length) : idx;
+      const pt = { x: Math.round(x), y: t.shares };
+      if (t.side === 'UP') upPts.push(pt);
+      else dnPts.push(pt);
+    }
+    chartTimeline.data.datasets[0].data = upPts;
+    chartTimeline.data.datasets[1].data = dnPts;
+    chartTimeline.update('none');
+  }
+
+  // Burst events
+  if (d.bursts && d.bursts.length > 0) {
+    document.getElementById('burst-list').innerHTML = d.bursts.map(b =>
+      `<span class="burst-tag">
+        ${b.time} | ${b.count}笔 (UP:${b.up} DN:${b.dn}) $${b.total_usdc}
+      </span>`
+    ).join('');
+  }
+
+  // ── PnL 盈亏 ──
+  const pnlExpBig = document.getElementById('pnl-expected-big');
+  const pnlExpVal = d.pnl_expected || 0;
+  pnlExpBig.textContent = (pnlExpVal >= 0 ? '+$' : '-$') + Math.abs(pnlExpVal).toFixed(2);
+  pnlExpBig.className = 'pnl-big ' + (pnlExpVal > 0 ? 'positive' : pnlExpVal < 0 ? 'negative' : 'zero');
+  const pnlExpPct = d.pnl_expected_pct || 0;
+  const dirText = d.btc_price > d.window_ptb ? 'UP' : 'DN';
+  document.getElementById('pnl-expected-label').textContent =
+    d.total_cost > 0 ? `预期 PnL (${dirText} 赢) | ${pnlExpPct >= 0 ? '+' : ''}${pnlExpPct.toFixed(1)}%` : '预期 PnL (等待交易)';
+
+  // MTM
+  const mtm = d.pnl_mtm || 0;
+  const mtmEl = document.getElementById('pnl-mtm');
+  mtmEl.textContent = (mtm >= 0 ? '+$' : '-$') + Math.abs(mtm).toFixed(2);
+  mtmEl.style.color = mtm > 0 ? 'var(--green)' : mtm < 0 ? 'var(--red)' : 'var(--accent)';
+
+  const mtmPct = d.pnl_mtm_pct || 0;
+  const mtmPctEl = document.getElementById('pnl-mtm-pct');
+  mtmPctEl.textContent = (mtmPct >= 0 ? '+' : '') + mtmPct.toFixed(1) + '%';
+  mtmPctEl.style.color = mtmPct > 0 ? 'var(--green)' : mtmPct < 0 ? 'var(--red)' : 'var(--accent)';
+
+  // If UP/DN wins
+  document.getElementById('pnl-if-up').textContent =
+    (d.pnl_if_up >= 0 ? '+$' : '-$') + Math.abs(d.pnl_if_up || 0).toFixed(2);
+  document.getElementById('pnl-if-dn').textContent =
+    (d.pnl_if_dn >= 0 ? '+$' : '-$') + Math.abs(d.pnl_if_dn || 0).toFixed(2);
+
+  // Avg prices
+  document.getElementById('avg-up-price').textContent =
+    d.avg_up_price > 0 ? d.avg_up_price.toFixed(4) : '--';
+  document.getElementById('avg-dn-price').textContent =
+    d.avg_dn_price > 0 ? d.avg_dn_price.toFixed(4) : '--';
+
+  // PnL chart
+  if (d.pnl_history && d.pnl_history.length > 0) {
+    chartPnl.data.labels = d.pnl_history.map(() => '');
+    chartPnl.data.datasets[0].data = d.pnl_history.map(h => h.mtm);
+    chartPnl.data.datasets[1].data = d.pnl_history.map(h => h.expected);
+    // 零轴参考线
+    chartPnl.update('none');
+  }
+
+  // ── 关联图表: 动量曲线 + 下单散点 ──
+  if (d.momentum_history && d.momentum_history.length > 0) {
+    // 动量曲线 (elapsed → momentum)
+    chartCorr.data.datasets[0].data = d.momentum_history.map(m => ({ x: m.elapsed, y: m.mom_1s || 0 }));
+    chartCorr.data.datasets[1].data = d.momentum_history.map(m => ({ x: m.elapsed, y: m.mom_3s || 0 }));
+    chartCorr.data.datasets[2].data = d.momentum_history.map(m => ({ x: m.elapsed, y: m.mom_5s || 0 }));
+  }
+  if (d.trade_momentum_snaps && d.trade_momentum_snaps.length > 0) {
+    const upPts = [], dnPts = [];
+    for (const s of d.trade_momentum_snaps) {
+      const pt = { x: s.elapsed, y: s.mom_5s || 0, shares: s.shares };
+      if (s.side === 'UP') upPts.push(pt);
+      else dnPts.push(pt);
+    }
+    chartCorr.data.datasets[3].data = upPts;
+    chartCorr.data.datasets[4].data = dnPts;
+  }
+  chartCorr.update('none');
+
+  // ── 多特征关联度排行 ──
+  function renderFeatureTable(prefix, fcData) {
+    if (!fcData) return;
+    const el = (id) => document.getElementById(id);
+    el(prefix + '-n').textContent = fcData.n || 0;
+    el(prefix + '-best').textContent = fcData.best_name || '--';
+    const tbody = el(prefix + '-body');
+    if (!tbody || !fcData.features || fcData.features.length === 0) {
+      if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:8px">样本不足 (n<3)</td></tr>';
+      return;
+    }
+    const catColors = { BTC: '#58a6ff', PM: '#d29922', '时序': '#bc8cff', '仓位': '#3fb950' };
+    let html = '';
+    fcData.features.forEach(f => {
+      const rColor = Math.abs(f.r) > 0.3 ? (f.r > 0 ? 'var(--green)' : 'var(--red)') :
+                     Math.abs(f.r) > 0.15 ? (f.r > 0 ? 'rgba(63,185,80,0.6)' : 'rgba(248,81,73,0.6)') : 'var(--text)';
+      const barW = Math.min(f.abs_r * 100, 100);
+      const barColor = f.r > 0 ? 'var(--green)' : f.r < 0 ? 'var(--red)' : 'var(--muted)';
+      const catColor = catColors[f.cat] || 'var(--muted)';
+      const rankBg = f.rank === 1 ? 'rgba(210,153,34,0.15)' : 'transparent';
+      html += `<tr style="border-bottom:1px solid rgba(48,54,61,0.5);background:${rankBg}">
+        <td style="padding:3px 4px;color:var(--muted)">${f.rank}</td>
+        <td style="padding:3px 4px;font-weight:${f.rank <= 3 ? 700 : 400}">${f.name}</td>
+        <td style="padding:3px 4px;font-size:9px;color:${catColor}">${f.cat}</td>
+        <td style="padding:3px 4px;text-align:right;color:${rColor};font-weight:700;font-family:monospace">
+          ${f.r >= 0 ? '+' : ''}${f.r.toFixed(4)}
+        </td>
+        <td style="padding:3px 4px">
+          <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">
+            <div style="height:100%;width:${barW}%;background:${barColor};border-radius:3px;transition:width 0.3s"></div>
+          </div>
+        </td>
+        <td style="padding:3px 4px;text-align:right;color:var(--muted)">${f.agree.toFixed(0)}</td>
+      </tr>`;
+    });
+    tbody.innerHTML = html;
+  }
+  renderFeatureTable('fc-w', d.feature_corr_window);
+  renderFeatureTable('fc-g', d.feature_corr_global);
+
+  // ── 历史结算 ──
+  const sPnl = d.settled_total_pnl || 0;
+  const sPnlEl = document.getElementById('settled-pnl');
+  sPnlEl.textContent = (sPnl >= 0 ? '+$' : '-$') + Math.abs(sPnl).toFixed(2);
+  sPnlEl.className = 'val ' + (sPnl > 0 ? 'green' : sPnl < 0 ? 'red' : '');
+
+  document.getElementById('settled-wins').textContent =
+    `${d.settled_wins || 0}/${d.settled_total || 0}`;
+
+  const wr = d.settled_total > 0 ? (d.settled_wins / d.settled_total * 100).toFixed(0) : '--';
+  const wrEl = document.getElementById('settled-wr');
+  wrEl.textContent = wr + '%';
+  wrEl.className = 'val ' + (wr > 50 ? 'green' : wr !== '--' ? 'red' : '');
+
+  if (d.settled_windows && d.settled_windows.length > 0) {
+    document.getElementById('settled-list').innerHTML = d.settled_windows.slice().reverse().map(w => {
+      const pCls = w.pnl >= 0 ? 'color:var(--green)' : 'color:var(--red)';
+      const wonCls = w.won === 'UP' ? 'color:var(--green)' : 'color:var(--red)';
+      return `<div class="settled-item">
+        <span style="color:var(--muted)">${w.question || w.slug}</span>
+        <span style="${wonCls}">${w.won}</span>
+        <span>${w.trades}单</span>
+        <span style="color:var(--muted)">$${w.cost}</span>
+        <span style="${pCls};font-weight:700">${w.pnl >= 0 ? '+' : ''}$${w.pnl.toFixed(2)}</span>
+      </div>`;
+    }).join('');
+  }
+
+  // Trade table
+  if (d.trades) {
+    const tbody = document.getElementById('trade-tbody');
+    let cumUp = 0, cumDn = 0;
+    let rows = '';
+    d.trades.forEach((t, i) => {
+      if (t.side === 'UP') cumUp += t.shares; else cumDn += t.shares;
+      const gap = cumUp - cumDn;
+      const cls = t.side === 'UP' ? 'up' : 'dn';
+      rows += `<tr>
+        <td>${i+1}</td>
+        <td>${t.time || ''}</td>
+        <td class="${cls}">${t.side}</td>
+        <td>${t.shares}</td>
+        <td>${t.price}</td>
+        <td>$${t.usdc}</td>
+        <td class="up">${cumUp.toFixed(1)}</td>
+        <td class="dn">${cumDn.toFixed(1)}</td>
+        <td style="color:${Math.abs(gap)>50?'var(--yellow)':'var(--text)'}">${gap>=0?'+':''}${gap.toFixed(1)}</td>
+      </tr>`;
+    });
+    tbody.innerHTML = rows;
+    // 自动滚到底部
+    const scroll = tbody.closest('.trade-scroll');
+    if (scroll) scroll.scrollTop = scroll.scrollHeight;
+  }
+}
+
+// 启动
+connectWS();
+</script>
+</body>
+</html>

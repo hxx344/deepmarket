@@ -1,0 +1,57 @@
+# ============================
+# 策略配置: 混合投票策略
+# ============================
+strategy:
+  name: "hybrid_voter"
+  module: src.strategy.templates.builtin
+  class: HybridStrategy
+  enabled: false                 # 默认关闭, 需要所有子策略可用
+
+  params:
+    # 投票阈值 (加权信号 > threshold 才触发交易)
+    threshold: 0.5
+
+    # 子策略权重
+    sub_strategies:
+      - name: "momentum"
+        module: src.strategy.templates.builtin
+        class: MomentumStrategy
+        weight: 0.4
+        params:
+          momentum_period: 10
+          momentum_threshold: 0.3
+          rsi_period: 14
+          rsi_overbought: 70
+          rsi_oversold: 30
+          bet_amount: 10.0
+
+      - name: "mean_reversion"
+        module: src.strategy.templates.builtin
+        class: MeanReversionStrategy
+        weight: 0.3
+        params:
+          bb_period: 20
+          bb_std_dev: 2.0
+          bet_amount: 10.0
+
+      - name: "orderflow"
+        module: src.strategy.templates.builtin
+        class: OrderFlowStrategy
+        weight: 0.3
+        params:
+          cvd_threshold: 100.0
+          pressure_threshold: 0.6
+          bet_amount: 10.0
+
+    # 下注参数 (最终执行)
+    bet_amount: 10.0
+    direction: "auto"
+
+  market_id: ""
+  interval: "5m"
+  cooldown_seconds: 300
+
+  constraints:
+    min_liquidity: 1000
+    min_volume_24h: 2000
+    max_spread_pct: 3.0

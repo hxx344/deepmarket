@@ -1,0 +1,26 @@
+# ============================
+# 策略配置: 均值回归策略
+# ============================
+strategy:
+  name: "mean_reversion_5min"
+  module: src.strategy.templates.builtin
+  class: MeanReversionStrategy
+  enabled: false
+
+  params:
+    # 布林带参数
+    bb_period: 20
+    bb_std_dev: 2.0
+
+    # 下注参数
+    bet_amount: 10.0
+    direction: "auto"
+
+  market_id: ""
+  interval: "5m"
+  cooldown_seconds: 300
+
+  constraints:
+    min_liquidity: 500
+    min_volume_24h: 1000
+    max_spread_pct: 5.0

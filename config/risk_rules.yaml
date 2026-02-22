@@ -1,0 +1,164 @@
+# ============================
+# 风控规则配置
+# ============================
+# 四层风控规则: 订单级 → 仓位级 → 账户级 → 系统级
+# enabled: 是否启用该规则
+# action: reject(拒绝) / warn(告警) / circuit_break(熔断)
+
+rules:
+  # === 第 1 层: 订单级风控 (R-1xx) ===
+  order_level:
+    - id: "R-101"
+      name: "单笔金额上限"
+      enabled: true
+      action: reject
+      params:
+        max_amount: 8.0
+      description: "单笔订单金额不得超过 $8"
+
+    - id: "R-102"
+      name: "最低赔率过滤"
+      enabled: true
+      action: reject
+      params:
+        min_odds: 0.05
+        max_odds: 0.95
+      description: "价格不在 [min_odds, max_odds] 区间内的订单将被拒绝"
+
+    - id: "R-103"
+      name: "滑点保护"
+      enabled: true
+      action: reject
+      params:
+        max_slippage_pct: 2.0
+      description: "预期滑点超过 max_slippage_pct 时拒绝下单"
+
+    - id: "R-104"
+      name: "最小挂单量检查"
+      enabled: true
+      action: reject
+      params:
+        min_size: 1.0
+      description: "订单数量低于 min_size 时拒绝"
+
+  # === 第 2 层: 仓位级风控 (R-2xx) ===
+  position_level:
+    - id: "R-201"
+      name: "单市场持仓上限"
+      enabled: true
+      action: reject
+      params:
+        max_position_usd: 100.0
+      description: "单个市场累计持仓不得超过 max_position_usd"
+
+    - id: "R-202"
+      name: "单市场敞口占比"
+      enabled: true
+      action: warn
+      params:
+        max_exposure_pct: 30.0
+      description: "单市场敞口超过总资产 max_exposure_pct% 时发出警告"
+
+    - id: "R-203"
+      name: "方向集中度"
+      enabled: true
+      action: warn
+      params:
+        max_direction_pct: 70.0
+      description: "同方向(Yes/No)持仓超过 max_direction_pct% 时发出警告"
+
+    - id: "R-204"
+      name: "持仓数量上限"
+      enabled: true
+      action: reject
+      params:
+        max_open_positions: 10
+      description: "同时持有的市场数量不得超过 max_open_positions"
+
+  # === 第 3 层: 账户级风控 (R-3xx) ===
+  account_level:
+    - id: "R-301"
+      name: "日亏损上限"
+      enabled: true
+      action: circuit_break
+      params:
+        max_daily_loss_usd: 50.0
+      description: "日内累计亏损超过 max_daily_loss_usd 时触发熔断"
+
+    - id: "R-302"
+      name: "日亏损率"
+      enabled: true
+      action: circuit_break
+      params:
+        max_daily_loss_pct: 10.0
+      description: "日内亏损率超过 max_daily_loss_pct% 时触发熔断"
+
+    - id: "R-303"
+      name: "账户余额最低要求"
+      enabled: true
+      action: circuit_break
+      params:
+        min_balance_usd: 10.0
+      description: "账户余额低于 min_balance_usd 时触发熔断"
+
+    - id: "R-304"
+      name: "连续亏损次数"
+      enabled: true
+      action: circuit_break
+      params:
+        max_consecutive_losses: 5
+      description: "连续亏损 max_consecutive_losses 次时触发熔断"
+
+  # === 第 4 层: 系统级风控 (R-4xx) ===
+  system_level:
+    - id: "R-401"
+      name: "API 频率限制"
+      enabled: true
+      action: reject
+      params:
+        max_orders_per_minute: 10
+      description: "每分钟下单次数不得超过 max_orders_per_minute"
+
+    - id: "R-402"
+      name: "数据新鲜度"
+      enabled: true
+      action: warn
+      params:
+        max_data_age_seconds: 30
+      description: "行情数据超过 max_data_age_seconds 秒未更新时发出警告"
+
+    - id: "R-403"
+      name: "系统错误率"
+      enabled: true
+      action: circuit_break
+      params:
+        max_error_rate_pct: 10.0
+        window_minutes: 5
+      description: "5 分钟内错误率超过 max_error_rate_pct% 时触发熔断"
+
+    - id: "R-404"
+      name: "网络延迟"
+      enabled: true
+      action: warn
+      params:
+        max_latency_ms: 5000
+      description: "网络延迟超过 max_latency_ms 毫秒时发出警告"
+
+# === 熔断器配置 ===
+circuit_breaker:
+  cooldown_seconds: 300         # 熔断冷却时间 (秒)
+  auto_resume: true             # 冷却结束后是否自动恢复
+  max_triggers_per_day: 3       # 每日最大熔断次数, 超过后需人工介入
+  notify_on_trigger: true       # 熔断触发时是否发送通知
+  notify_channels:
+    - console
+    - telegram
+
+# === 日重置配置 ===
+daily_reset:
+  reset_time_utc: "00:00"       # 每日重置时间 (UTC)
+  reset_fields:
+    - daily_pnl
+    - daily_order_count
+    - consecutive_losses
+    - error_count

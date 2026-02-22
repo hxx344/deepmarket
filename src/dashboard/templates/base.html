@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Dashboard{% endblock %} — PM BTC Predictor</title>
+
+  <!-- TailwindCSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50:'#eef2ff',100:'#e0e7ff',500:'#6366f1',600:'#4f46e5',700:'#4338ca',800:'#3730a3',900:'#312e81' },
+            up:   '#22c55e',
+            down: '#ef4444',
+            surface: { 1:'#111827', 2:'#1f2937', 3:'#374151' },
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Alpine.js -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+  <!-- TradingView Lightweight Charts -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+
+  <style>
+    [x-cloak] { display: none !important; }
+    .sidebar-link { @apply flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors duration-150; }
+    .sidebar-link:hover { @apply bg-surface-3 text-white; }
+    .sidebar-link.active { @apply bg-brand-600 text-white; }
+    .card { @apply bg-surface-2 rounded-xl border border-gray-700/50 p-5; }
+    .stat-value { @apply text-2xl font-bold tracking-tight; }
+    .stat-label { @apply text-xs text-gray-400 uppercase tracking-wider mt-1; }
+    .badge { @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium; }
+    .badge-green { @apply bg-green-500/20 text-green-400; }
+    .badge-red { @apply bg-red-500/20 text-red-400; }
+    .badge-yellow { @apply bg-yellow-500/20 text-yellow-400; }
+    .badge-blue { @apply bg-blue-500/20 text-blue-400; }
+    .btn { @apply px-4 py-2 rounded-lg text-sm font-medium transition-colors; }
+    .btn-primary { @apply bg-brand-600 hover:bg-brand-700 text-white; }
+    .btn-danger { @apply bg-red-600 hover:bg-red-700 text-white; }
+    .btn-outline { @apply border border-gray-600 hover:bg-surface-3 text-gray-300; }
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #1f2937; }
+    ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+  </style>
+  {% block head %}{% endblock %}
+</head>
+
+<body class="h-full bg-surface-1 text-gray-200 dark" x-data="app()">
+  <div class="flex h-full">
+
+    <!-- ═══════ Sidebar ═══════ -->
+    <aside class="w-60 flex-shrink-0 bg-surface-2 border-r border-gray-700/50 flex flex-col">
+      <!-- Logo -->
+      <div class="px-5 py-4 border-b border-gray-700/50">
+        <h1 class="text-lg font-bold text-white tracking-tight">
+          <span class="text-brand-500">PM</span> BTC Predictor
+        </h1>
+        <p class="text-xs text-gray-500 mt-0.5">5-min Prediction System</p>
+      </div>
+
+      <!-- Nav -->
+      <nav class="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+        {% set nav_items = [
+          ("overview",  "总览",     "M3 13h8M3 6.5h17M3 6.5h17"),
+          ("trades",    "行情中心", ""),
+          ("strategy",  "策略管理", ""),
+          ("backtest",  "回测中心", ""),
+          ("risk",      "风控面板", ""),
+          ("settings",  "系统设置", ""),
+        ] %}
+
+        {% set icons = {
+          "overview":  '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z"/></svg>',
+          "strategy":  '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>',
+          "backtest":  '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>',
+          "trades":    '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3.75 3v11.25A2.25 2.25 0 006 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0118 16.5h-2.25m-7.5 0h7.5m-7.5 0l-1 3m8.5-3l1 3m0 0l.5 1.5m-.5-1.5h-9.5m0 0l-.5 1.5M9 11.25v1.5M12 9v3.75m3-6v6"/></svg>',
+          "risk":      '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z"/></svg>',
+          "settings":  '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M10.343 3.94c.09-.542.56-.94 1.11-.94h1.093c.55 0 1.02.398 1.11.94l.149.894c.07.424.384.764.78.93.398.164.855.142 1.205-.108l.737-.527a1.125 1.125 0 011.45.12l.773.774c.39.389.44 1.002.12 1.45l-.527.737c-.25.35-.272.806-.107 1.204.165.397.505.71.93.78l.893.15c.543.09.94.56.94 1.109v1.094c0 .55-.397 1.02-.94 1.11l-.893.149c-.425.07-.765.383-.93.78-.165.398-.143.854.107 1.204l.527.738c.32.447.269 1.06-.12 1.45l-.774.773a1.125 1.125 0 01-1.449.12l-.738-.527c-.35-.25-.806-.272-1.204-.107-.397.165-.71.505-.78.929l-.15.894c-.09.542-.56.94-1.11.94h-1.094c-.55 0-1.019-.398-1.11-.94l-.148-.894c-.071-.424-.384-.764-.781-.93-.398-.164-.854-.142-1.204.108l-.738.527c-.447.32-1.06.269-1.45-.12l-.773-.774a1.125 1.125 0 01-.12-1.45l.527-.737c.25-.35.273-.806.108-1.204-.165-.397-.506-.71-.93-.78l-.894-.15c-.542-.09-.94-.56-.94-1.109v-1.094c0-.55.398-1.02.94-1.11l.894-.149c.424-.07.765-.383.93-.78.165-.398.143-.854-.108-1.204l-.526-.738a1.125 1.125 0 01.12-1.45l.773-.773a1.125 1.125 0 011.45-.12l.737.527c.35.25.807.272 1.204.107.397-.165.71-.505.78-.929l.15-.894z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>',
+        } %}
+
+        {% for page_id, label, _ in nav_items %}
+        <a href="/{{ page_id }}"
+           class="sidebar-link {{ 'active' if active_page == page_id else '' }}">
+          {{ icons[page_id] | safe }}
+          <span>{{ label }}</span>
+        </a>
+        {% endfor %}
+      </nav>
+
+      <!-- Status Bar -->
+      <div class="px-4 py-3 border-t border-gray-700/50 text-xs text-gray-500 space-y-1">
+        <div class="flex justify-between">
+          <span>模式</span>
+          <span class="badge badge-blue">{{ run_mode | upper }}</span>
+        </div>
+        <div class="flex justify-between">
+          <span>WS 连接</span>
+          <span x-text="wsConnected ? '●' : '○'" :class="wsConnected ? 'text-green-400' : 'text-red-400'"></span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ═══════ Main Content ═══════ -->
+    <main class="flex-1 flex flex-col overflow-hidden">
+      <!-- Top Bar -->
+      <header class="h-14 flex-shrink-0 bg-surface-2 border-b border-gray-700/50 flex items-center justify-between px-6">
+        <div class="flex items-center gap-4">
+          <h2 class="text-base font-semibold">{% block page_title %}Dashboard{% endblock %}</h2>
+        </div>
+        <div class="flex items-center gap-4 text-sm">
+          <!-- Live BTC Price -->
+          <div class="flex items-center gap-2">
+            <span class="text-gray-400">BTC</span>
+            <span class="font-mono font-bold" :class="priceDirection > 0 ? 'text-up' : priceDirection < 0 ? 'text-down' : 'text-white'"
+                  x-text="'$' + btcPrice.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">
+              $0.00
+            </span>
+            <span class="text-xs" x-show="btcPriceAge > 10"
+                  :class="btcPriceAge > 60 ? 'text-red-400' : 'text-yellow-500'"
+                  x-text="btcPriceAge > 60 ? (Math.floor(btcPriceAge/60) + 'm') : (btcPriceAge + 's')"></span>
+          </div>
+          <!-- Uptime -->
+          <span class="text-gray-500" x-text="formatUptime(uptime)">00:00:00</span>
+        </div>
+      </header>
+
+      <!-- Page Content -->
+      <div class="flex-1 overflow-y-auto p-6">
+        {% block content %}{% endblock %}
+      </div>
+    </main>
+  </div>
+
+  <!-- ═══════ Global JS ═══════ -->
+  <script src="/static/js/ws.js"></script>
+  <script src="/static/js/utils.js"></script>
+  <script>
+    function app() {
+      return {
+        // ── 全局状态 ──
+        wsConnected: false,
+        btcPrice: {{ market.btc_price or 0 }},
+        prevBtcPrice: 0,
+        priceDirection: 0,
+        btcPriceUpdatedAt: 0,  // 最后一次 oracle 价格变化的时间戳
+        btcPriceAge: 0,        // 距离上次价格变化的秒数
+        _btcPriceAgeTimer: null,
+        uptime: 0,
+
+        // ── 账户 ──
+        balance: {{ account.balance or 0 }},
+        equity: {{ account.total_equity or 0 }},
+        dailyPnl: {{ account.daily_pnl or 0 }},
+        totalPnl: {{ account.total_pnl or 0 }},
+
+        // ── PM 市场价格 ──
+        pmYesPrice: {{ market.pm_yes_price or 0 }},
+        pmNoPrice: {{ market.pm_no_price or 0 }},
+        pmYesBid: {{ market.pm_yes_bid or 0 }},
+        pmYesAsk: {{ market.pm_yes_ask or 0 }},
+        pmNoBid: {{ market.pm_no_bid or 0 }},
+        pmNoAsk: {{ market.pm_no_ask or 0 }},
+        pmQuestion: '{{ market.pm_market_question|default("", true)|e }}',
+        pmSecondsLeft: 0,
+        pmWindowStartPrice: {{ market.pm_window_start_price or 0 }},
+        _pmCountdownTimer: null,
+
+        // ── 策略实时状态 ──
+        strategyState: {},
+
+        // ── 初始化 ──
+        init() {
+          this.connectWs();
+          // 每秒更新 oracle 价格年龄
+          this._btcPriceAgeTimer = setInterval(() => {
+            if (this.btcPriceUpdatedAt > 0) {
+              this.btcPriceAge = Math.floor(Date.now() / 1000 - this.btcPriceUpdatedAt);
+            }
+          }, 1000);
+          // 前端精确倒计时: 直接用本地时钟对齐 5 分钟边界 (UTC)
+          this._startPreciseCountdown();
+        },
+
+        connectWs() {
+          // 防止重复连接 (Alpine v3 auto-calls init)
+          if (window._dashWs) {
+            window._dashWs.destroy();
+          }
+          const wsUrl = '{{ ws_url }}';
+          window._dashWs = new DashboardWebSocket(wsUrl, {
+            onOpen: () => { this.wsConnected = true; },
+            onClose: () => { this.wsConnected = false; },
+            onMessage: (msg) => this.handleMessage(msg),
+          });
+          window._dashWs.connect();
+        },
+
+        handleMessage(msg) {
+          const { type, data, ts } = msg;
+          switch (type) {
+            case 'snapshot':
+              if (data.account) {
+                this.balance = data.account.balance;
+                this.equity = data.account.total_equity;
+                this.dailyPnl = data.account.daily_pnl;
+                this.totalPnl = data.account.total_pnl;
+              }
+              if (data.market) {
+                this.updatePrice(data.market.btc_price);
+                if (data.market.btc_price_updated_at) this.btcPriceUpdatedAt = data.market.btc_price_updated_at;
+                if (data.market.pm_yes_price !== undefined) this.pmYesPrice = data.market.pm_yes_price;
+                if (data.market.pm_no_price !== undefined) this.pmNoPrice = data.market.pm_no_price;
+                if (data.market.pm_yes_bid !== undefined) this.pmYesBid = data.market.pm_yes_bid;
+                if (data.market.pm_yes_ask !== undefined) this.pmYesAsk = data.market.pm_yes_ask;
+                if (data.market.pm_no_bid !== undefined) this.pmNoBid = data.market.pm_no_bid;
+                if (data.market.pm_no_ask !== undefined) this.pmNoAsk = data.market.pm_no_ask;
+                if (data.market.pm_market_question) this.pmQuestion = data.market.pm_market_question;
+                if (data.market.pm_window_seconds_left !== undefined) this.startCountdown(data.market.pm_window_seconds_left);
+                if (data.market.pm_window_start_price > 0) this.pmWindowStartPrice = data.market.pm_window_start_price;
+              }
+              if (data.system) {
+                this.uptime = data.system.uptime;
+              }
+              if (data.strategy && Object.keys(data.strategy).length) {
+                this.strategyState = data.strategy;
+              }
+              break;
+            case 'price':
+              if (data.price) this.updatePrice(data.price);
+              break;
+            case 'price_history':
+              // 新客户端连接时回放历史 tick 数据
+              break;
+            case 'heartbeat':
+              if (data.btc_price) this.updatePrice(data.btc_price);
+              if (data.btc_price_updated_at) this.btcPriceUpdatedAt = data.btc_price_updated_at;
+              if (data.balance !== undefined) this.balance = data.balance;
+              if (data.equity !== undefined) this.equity = data.equity;
+              if (data.daily_pnl !== undefined) this.dailyPnl = data.daily_pnl;
+              if (data.uptime) this.uptime = data.uptime;
+              if (data.pm_yes_price !== undefined) this.pmYesPrice = data.pm_yes_price;
+              if (data.pm_no_price !== undefined) this.pmNoPrice = data.pm_no_price;
+              if (data.pm_yes_bid !== undefined) this.pmYesBid = data.pm_yes_bid;
+              if (data.pm_yes_ask !== undefined) this.pmYesAsk = data.pm_yes_ask;
+              if (data.pm_no_bid !== undefined) this.pmNoBid = data.pm_no_bid;
+              if (data.pm_no_ask !== undefined) this.pmNoAsk = data.pm_no_ask;
+              if (data.pm_market_question) this.pmQuestion = data.pm_market_question;
+              if (data.pm_window_seconds_left !== undefined) this.startCountdown(data.pm_window_seconds_left);
+              if (data.pm_window_start_price > 0) this.pmWindowStartPrice = data.pm_window_start_price;
+              if (data.strategy && Object.keys(data.strategy).length) this.strategyState = data.strategy;
+              break;
+          }
+          // 派发自定义事件，页面自己的 JS 可监听
+          if (type === 'strategy' && data) {
+            this.strategyState = data;
+          }
+          window.dispatchEvent(new CustomEvent('dash:' + type, { detail: msg }));
+        },
+
+        updatePrice(price) {
+          if (price <= 0) return;
+          this.prevBtcPrice = this.btcPrice;
+          if (Math.abs(price - this.btcPrice) > 0.01) {
+            this.btcPriceUpdatedAt = Date.now() / 1000;
+            this.btcPriceAge = 0;
+          }
+          this.btcPrice = price;
+          this.priceDirection = price > this.prevBtcPrice ? 1 : price < this.prevBtcPrice ? -1 : 0;
+        },
+
+        formatUptime(seconds) {
+          const h = Math.floor(seconds / 3600);
+          const m = Math.floor((seconds % 3600) / 60);
+          const s = Math.floor(seconds % 60);
+          return `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+        },
+
+        startCountdown(serverSecsLeft) {
+          // 忽略服务器 seconds_left, 直接用前端精确倒计时
+          // (保留接口兼容, 但不再依赖服务端同步)
+        },
+
+        _startPreciseCountdown() {
+          // 前端精确倒计时: 用本地 UTC 时钟直接计算 5-min 窗口剩余秒数
+          // 完全不依赖服务端推送, 消除轮询延迟造成的偏差
+          const calcSecsLeft = () => {
+            const nowSec = Date.now() / 1000;
+            const elapsed = nowSec % 300;  // 当前 5-min 窗口已过秒数
+            return Math.max(0, Math.ceil(300 - elapsed));
+          };
+          this.pmSecondsLeft = calcSecsLeft();
+          if (this._pmCountdownTimer) clearInterval(this._pmCountdownTimer);
+          this._pmCountdownTimer = setInterval(() => {
+            this.pmSecondsLeft = calcSecsLeft();
+          }, 1000);
+        },
+
+        formatCountdown(secs) {
+          const m = Math.floor(secs / 60);
+          const s = Math.floor(secs % 60);
+          return `${m}:${s.toString().padStart(2,'0')}`;
+        },
+
+        formatUSD(val) {
+          return '$' + Number(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        },
+
+        formatPnl(val) {
+          const sign = val >= 0 ? '+' : '';
+          return sign + '$' + Math.abs(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        },
+      };
+    }
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

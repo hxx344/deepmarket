@@ -1,0 +1,451 @@
+{% extends "base.html" %}
+{% block title %}行情中心{% endblock %}
+{% block page_title %}行情中心{% endblock %}
+
+{% block content %}
+<div class="space-y-6" x-data="tradesPage()" x-init="init()">
+
+  <!-- ═══════════ 行情区域 ═══════════ -->
+
+  <!-- PM 市场信息 -->
+  <div class="card py-2 px-4" x-show="pmQuestion">
+    <p class="text-xs text-gray-400">
+      <span class="text-brand-500 font-semibold">PM 5min 市场:</span>
+      <span x-text="pmQuestion" class="text-gray-300"></span>
+      <span class="ml-3 text-yellow-400 font-mono" x-show="pmSecondsLeft > 0"
+            x-text="'⏱ ' + formatCountdown(pmSecondsLeft)"></span>
+    </p>
+  </div>
+
+  <!-- 价格概要 -->
+  <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+    <div class="card py-3">
+      <p class="stat-label">BTC/USD <span class="text-gray-600 normal-case">(Chainlink)</span></p>
+      <p class="text-xl font-bold font-mono"
+         :class="priceDirection > 0 ? 'text-up' : priceDirection < 0 ? 'text-down' : 'text-white'"
+         x-text="formatUSD(btcPrice)">$0.00</p>
+      <p class="text-xs mt-1"
+         x-show="btcPriceAge > 10"
+         :class="btcPriceAge > 60 ? 'text-red-400' : 'text-yellow-500'"
+         x-text="'Oracle 更新 ' + (btcPriceAge > 60 ? Math.floor(btcPriceAge/60) + 'm' : btcPriceAge + 's') + ' 前'"></p>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">基准价格 <span class="text-gray-600 normal-case">(Price to Beat)</span></p>
+      <p class="text-xl font-bold font-mono text-orange-400"
+         x-text="pmWindowStartPrice > 0 ? formatUSD(pmWindowStartPrice) : '等待中...'">等待中...</p>
+      <p class="text-xs mt-1"
+         x-show="pmWindowStartPrice > 0 && btcPrice > 0"
+         :class="btcPrice >= pmWindowStartPrice ? 'text-up' : 'text-down'"
+         x-text="(btcPrice >= pmWindowStartPrice ? '▲ ' : '▼ ') + formatUSD(Math.abs(btcPrice - pmWindowStartPrice))">
+      </p>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">PM UP <span class="text-gray-600 normal-case">(Mid)</span></p>
+      <p class="text-xl font-bold"
+         :class="pmYesPrice > 0 ? 'text-up' : 'text-gray-500'"
+         x-text="pmYesPrice > 0 ? '$' + pmYesPrice.toFixed(4) : '搜索中...'">$0.00</p>
+      <div class="flex justify-between text-xs mt-1 font-mono">
+        <span class="text-green-400" x-text="pmYesBid > 0 ? 'Bid ' + pmYesBid.toFixed(4) : ''"></span>
+        <span class="text-red-400" x-text="pmYesAsk > 0 ? 'Ask ' + pmYesAsk.toFixed(4) : ''"></span>
+      </div>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">PM DOWN <span class="text-gray-600 normal-case">(Mid)</span></p>
+      <p class="text-xl font-bold"
+         :class="pmNoPrice > 0 ? 'text-down' : 'text-gray-500'"
+         x-text="pmNoPrice > 0 ? '$' + pmNoPrice.toFixed(4) : '搜索中...'">$0.00</p>
+      <div class="flex justify-between text-xs mt-1 font-mono">
+        <span class="text-green-400" x-text="pmNoBid > 0 ? 'Bid ' + pmNoBid.toFixed(4) : ''"></span>
+        <span class="text-red-400" x-text="pmNoAsk > 0 ? 'Ask ' + pmNoAsk.toFixed(4) : ''"></span>
+      </div>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">窗口倒计时</p>
+      <p class="text-xl font-bold font-mono"
+         :class="pmSecondsLeft < 30 ? 'text-red-400' : 'text-yellow-400'"
+         x-text="pmSecondsLeft > 0 ? formatCountdown(pmSecondsLeft) : '--:--'">--:--</p>
+    </div>
+    <div class="card py-3" x-data="{ ticks: 0, rate: 0 }" x-init="
+      window.addEventListener('dash:price', () => ticks++);
+      setInterval(() => { rate = ticks; ticks = 0; }, 1000);
+    ">
+      <p class="stat-label">Ticks/s</p>
+      <p class="text-xl font-bold text-yellow-400" x-text="rate">0</p>
+    </div>
+  </div>
+
+  <!-- 实时 tick 图 + 成交流 -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <!-- 实时 Tick -->
+    <div class="card">
+      <h3 class="text-sm font-semibold text-gray-300 mb-3">实时价格 Tick</h3>
+      <div id="market-tick-chart" style="height: 250px;"></div>
+    </div>
+
+    <!-- 最近成交 -->
+    <div class="card">
+      <h3 class="text-sm font-semibold text-gray-300 mb-3">PM 最近成交</h3>
+      <div x-data="{ pmTrades: [] }" x-init="
+        window.addEventListener('dash:pm_trade', e => {
+          pmTrades.unshift(e.detail.data);
+          if (pmTrades.length > 20) pmTrades.pop();
+        });
+      ">
+        <div class="overflow-y-auto" style="max-height: 250px;">
+          <table class="w-full text-xs">
+            <thead class="text-gray-500 border-b border-gray-700/50">
+              <tr>
+                <th class="text-left py-1">方向</th>
+                <th class="text-right py-1">价格</th>
+                <th class="text-right py-1">数量</th>
+                <th class="text-right py-1">时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-if="pmTrades.length === 0">
+                <tr><td colspan="4" class="text-center py-4 text-gray-500">等待成交数据...</td></tr>
+              </template>
+              <template x-for="t in pmTrades" :key="t.id || Math.random()">
+                <tr class="border-b border-gray-700/20">
+                  <td :class="t.side === 'buy' ? 'text-up' : 'text-down'" x-text="t.side?.toUpperCase()"></td>
+                  <td class="text-right font-mono" x-text="Number(t.price || 0).toFixed(4)"></td>
+                  <td class="text-right font-mono" x-text="Number(t.size || t.quantity || 0).toFixed(2)"></td>
+                  <td class="text-right text-gray-500" x-text="t.timestamp ? new Date(t.timestamp*1000).toLocaleTimeString() : ''"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 订单簿区域 ═══════════ -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <!-- UP 订单簿 -->
+    <div class="card px-0 py-0 overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-2 border-b border-gray-700/40">
+        <h3 class="text-sm font-semibold text-gray-200">UP 订单簿</h3>
+        <div class="flex gap-3 text-xs text-gray-500">
+          <span>B <span class="text-up font-mono" x-text="formatUSD(upBidDepth)"></span></span>
+          <span>S <span class="text-down font-mono" x-text="formatUSD(upAskDepth)"></span></span>
+        </div>
+      </div>
+      <table class="w-full text-xs font-mono">
+        <thead class="text-gray-500">
+          <tr class="border-b border-gray-700/30">
+            <th class="text-left py-1 pl-4">价格</th>
+            <th class="text-right py-1">数量</th>
+            <th class="text-right py-1 pr-4">累计</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- Asks: 反转显示，最低价在底部贴近中间 -->
+          <template x-for="(a, i) in upAsksReversed" :key="'ua'+i">
+            <tr class="h-6" :style="'background:linear-gradient(to left,rgba(239,68,68,0.1) '+(a.pct||0)+'%,transparent '+(a.pct||0)+'%)'">
+              <td class="text-down pl-4" x-text="a.price.toFixed(4)"></td>
+              <td class="text-right" x-text="a.quantity.toFixed(2)"></td>
+              <td class="text-right text-gray-500 pr-4" x-text="a.cumQty?.toFixed(2) || ''"></td>
+            </tr>
+          </template>
+          <!-- 中间价格栏 -->
+          <tr class="h-8 border-y border-gray-600/40">
+            <td colspan="3" class="text-center">
+              <span class="text-base font-bold font-mono"
+                    :class="upBids[0]?.price > 0 ? 'text-white' : 'text-gray-500'"
+                    x-text="upBids[0]?.price > 0 ? ((upBids[0].price + (upAsks.length ? upAsks[0].price : upBids[0].price)) / 2).toFixed(4) : '--'"></span>
+              <span class="text-xs text-yellow-400 ml-2" x-text="upSpread > 0 ? '↔ ' + upSpread.toFixed(4) : ''"></span>
+              <span class="text-xs ml-2" :class="upImbalance >= 1 ? 'text-up' : 'text-down'">
+                <span class="text-up" x-text="'B ' + (upImbalance >= 1 ? ((upBidDepth/(upBidDepth+upAskDepth))*100).toFixed(0) : ((upBidDepth/(upBidDepth+upAskDepth))*100).toFixed(0)) + '%'"></span>
+                <span class="text-down ml-1" x-text="'S ' + ((upAskDepth/(upBidDepth+upAskDepth))*100).toFixed(0) + '%'"></span>
+              </span>
+            </td>
+          </tr>
+          <!-- Bids: 最高价在顶部贴近中间 -->
+          <template x-for="(b, i) in upBidsDisplay" :key="'ub'+i">
+            <tr class="h-6" :style="'background:linear-gradient(to left,rgba(34,197,94,0.1) '+(b.pct||0)+'%,transparent '+(b.pct||0)+'%)'">
+              <td class="text-up pl-4" x-text="b.price.toFixed(4)"></td>
+              <td class="text-right" x-text="b.quantity.toFixed(2)"></td>
+              <td class="text-right text-gray-500 pr-4" x-text="b.cumQty?.toFixed(2) || ''"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- DOWN 订单簿 -->
+    <div class="card px-0 py-0 overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-2 border-b border-gray-700/40">
+        <h3 class="text-sm font-semibold text-gray-200">DOWN 订单簿</h3>
+        <div class="flex gap-3 text-xs text-gray-500">
+          <span>B <span class="text-up font-mono" x-text="formatUSD(downBidDepth)"></span></span>
+          <span>S <span class="text-down font-mono" x-text="formatUSD(downAskDepth)"></span></span>
+        </div>
+      </div>
+      <table class="w-full text-xs font-mono">
+        <thead class="text-gray-500">
+          <tr class="border-b border-gray-700/30">
+            <th class="text-left py-1 pl-4">价格</th>
+            <th class="text-right py-1">数量</th>
+            <th class="text-right py-1 pr-4">累计</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="(a, i) in downAsksReversed" :key="'da'+i">
+            <tr class="h-6" :style="'background:linear-gradient(to left,rgba(239,68,68,0.1) '+(a.pct||0)+'%,transparent '+(a.pct||0)+'%)'">
+              <td class="text-down pl-4" x-text="a.price.toFixed(4)"></td>
+              <td class="text-right" x-text="a.quantity.toFixed(2)"></td>
+              <td class="text-right text-gray-500 pr-4" x-text="a.cumQty?.toFixed(2) || ''"></td>
+            </tr>
+          </template>
+          <tr class="h-8 border-y border-gray-600/40">
+            <td colspan="3" class="text-center">
+              <span class="text-base font-bold font-mono"
+                    :class="downBids[0]?.price > 0 ? 'text-white' : 'text-gray-500'"
+                    x-text="downBids[0]?.price > 0 ? ((downBids[0].price + (downAsks.length ? downAsks[0].price : downBids[0].price)) / 2).toFixed(4) : '--'"></span>
+              <span class="text-xs text-yellow-400 ml-2" x-text="downSpread > 0 ? '↔ ' + downSpread.toFixed(4) : ''"></span>
+              <span class="text-xs ml-2" :class="downImbalance >= 1 ? 'text-up' : 'text-down'">
+                <span class="text-up" x-text="'B ' + ((downBidDepth/(downBidDepth+downAskDepth))*100 || 0).toFixed(0) + '%'"></span>
+                <span class="text-down ml-1" x-text="'S ' + ((downAskDepth/(downBidDepth+downAskDepth))*100 || 0).toFixed(0) + '%'"></span>
+              </span>
+            </td>
+          </tr>
+          <template x-for="(b, i) in downBidsDisplay" :key="'db'+i">
+            <tr class="h-6" :style="'background:linear-gradient(to left,rgba(34,197,94,0.1) '+(b.pct||0)+'%,transparent '+(b.pct||0)+'%)'">
+              <td class="text-up pl-4" x-text="b.price.toFixed(4)"></td>
+              <td class="text-right" x-text="b.quantity.toFixed(2)"></td>
+              <td class="text-right text-gray-500 pr-4" x-text="b.cumQty?.toFixed(2) || ''"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ═══════════ 交易记录区域 ═══════════ -->
+
+  <!-- 交易统计 -->
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+    <div class="card py-3">
+      <p class="stat-label">总交易数</p>
+      <p class="stat-value text-white" x-text="total">0</p>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">总盈亏</p>
+      <p class="stat-value" :class="totalPnl >= 0 ? 'text-up' : 'text-down'" x-text="formatPnl(totalPnl)">$0</p>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">胜率</p>
+      <p class="stat-value text-yellow-400" x-text="winRate.toFixed(1) + '%'">0%</p>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">平均盈亏比</p>
+      <p class="stat-value text-brand-500" x-text="profitFactor.toFixed(2)">0</p>
+    </div>
+  </div>
+
+  <!-- 交易表格 -->
+  <div class="card">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="text-sm font-semibold text-gray-300">交易记录</h3>
+      <button class="btn btn-outline text-xs" @click="loadTrades()">刷新</button>
+    </div>
+
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="text-gray-500 border-b border-gray-700/50 text-xs">
+          <tr>
+            <th class="text-left py-2 px-2">时间</th>
+            <th class="text-left py-2 px-2">市场</th>
+            <th class="text-left py-2 px-2">方向</th>
+            <th class="text-right py-2 px-2">价格</th>
+            <th class="text-right py-2 px-2">数量</th>
+            <th class="text-right py-2 px-2">金额</th>
+            <th class="text-right py-2 px-2">盈亏</th>
+            <th class="text-left py-2 px-2">策略</th>
+            <th class="text-left py-2 px-2">状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-if="trades.length === 0">
+            <tr><td colspan="9" class="text-center py-8 text-gray-500">暂无交易记录</td></tr>
+          </template>
+          <template x-for="t in trades" :key="t.id || t.timestamp">
+            <tr class="border-b border-gray-700/20 hover:bg-surface-3/50">
+              <td class="py-2 px-2 text-xs text-gray-400" x-text="t.timestamp ? new Date(t.timestamp * 1000).toLocaleString('zh-CN') : ''"></td>
+              <td class="py-2 px-2" x-text="t.market || 'BTC-5min'"></td>
+              <td class="py-2 px-2" :class="t.side === 'buy' ? 'text-up' : 'text-down'" x-text="t.side?.toUpperCase()"></td>
+              <td class="py-2 px-2 text-right font-mono" x-text="Number(t.price || 0).toFixed(4)"></td>
+              <td class="py-2 px-2 text-right font-mono" x-text="Number(t.quantity || t.size || 0).toFixed(2)"></td>
+              <td class="py-2 px-2 text-right font-mono" x-text="formatUSD(t.amount || 0)"></td>
+              <td class="py-2 px-2 text-right font-mono"
+                  :class="(t.pnl || 0) >= 0 ? 'text-up' : 'text-down'"
+                  x-text="formatPnl(t.pnl || 0)"></td>
+              <td class="py-2 px-2 text-xs text-gray-400" x-text="t.strategy || '-'"></td>
+              <td class="py-2 px-2">
+                <span class="badge"
+                      :class="t.status === 'filled' ? 'badge-green' : t.status === 'cancelled' ? 'badge-red' : 'badge-yellow'"
+                      x-text="t.status || 'filled'"></span>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── 实时 Tick 图表 ──
+let tickChart, tickSeries, refPriceLine;
+let _currentRefPrice = 0;
+
+document.addEventListener('alpine:init', () => {
+  setTimeout(() => {
+    const tickEl = document.getElementById('market-tick-chart');
+    if (tickEl) {
+      const res = createLineChart(tickEl);
+      tickChart = res.chart;
+      tickSeries = res.lineSeries;
+
+      const addTick = throttle((price) => {
+        tickSeries.update({ time: Math.floor(Date.now() / 1000), value: price });
+      }, 500);
+
+      window.addEventListener('dash:price', (e) => {
+        const price = e.detail?.data?.price;
+        if (price > 0) addTick(price);
+      });
+
+      window.addEventListener('dash:price_history', (e) => {
+        const prices = e.detail?.data?.prices;
+        if (prices && prices.length > 0) {
+          const seen = new Set();
+          const sorted = prices
+            .filter(p => { if (seen.has(p.time)) return false; seen.add(p.time); return true; })
+            .sort((a, b) => a.time - b.time);
+          tickSeries.setData(sorted);
+        }
+      });
+
+      new ResizeObserver(() => {
+        tickChart.applyOptions({ width: tickEl.clientWidth });
+      }).observe(tickEl);
+
+      // 监听基准价格变化，绘制参考线
+      function updateRefLine(price) {
+        if (!tickSeries || price <= 0 || price === _currentRefPrice) return;
+        _currentRefPrice = price;
+        if (refPriceLine) {
+          tickSeries.removePriceLine(refPriceLine);
+        }
+        refPriceLine = tickSeries.createPriceLine({
+          price: price,
+          color: '#f97316',
+          lineWidth: 2,
+          lineStyle: 2,  // Dashed
+          axisLabelVisible: true,
+          title: 'PTB',
+        });
+      }
+
+      // 初始值
+      const initRef = document.querySelector('[x-data]')?.__x?.$data?.pmWindowStartPrice
+        || window.__alpineData?.pmWindowStartPrice || 0;
+      if (initRef > 0) updateRefLine(initRef);
+
+      // 通过 snapshot/heartbeat 更新 (PTB 由后端基于 Chainlink observationsTimestamp 精确捕获)
+      window.addEventListener('dash:snapshot', (e) => {
+        const p = e.detail?.data?.market?.pm_window_start_price;
+        if (p > 0) updateRefLine(p);
+      });
+      window.addEventListener('dash:heartbeat', (e) => {
+        const p = e.detail?.data?.pm_window_start_price;
+        if (p > 0) updateRefLine(p);
+      });
+    }
+  }, 300);
+});
+
+// ── 数据管理 ──
+function tradesPage() {
+  return {
+    // UP 订单簿数据
+    upBids: [], upAsks: [], upSpread: 0, upImbalance: 0, upBidDepth: 0, upAskDepth: 0,
+    // DOWN 订单簿数据
+    downBids: [], downAsks: [], downSpread: 0, downImbalance: 0, downBidDepth: 0, downAskDepth: 0,
+    // 显示用 (Asks 反转，取前 N 档)
+    get upAsksReversed() { return [...this.upAsks].slice(0, 15).reverse(); },
+    get upBidsDisplay() { return this.upBids.slice(0, 15); },
+    get downAsksReversed() { return [...this.downAsks].slice(0, 15).reverse(); },
+    get downBidsDisplay() { return this.downBids.slice(0, 15); },
+    // 交易数据
+    trades: [], total: 0, totalPnl: 0, winRate: 0, profitFactor: 0,
+
+    async init() {
+      await Promise.all([this.loadOrderbook(), this.loadTrades()]);
+      window.addEventListener('dash:orderbook', () => this.loadOrderbook());
+      window.addEventListener('dash:trades', (e) => {
+        this.trades.unshift(e.detail.data);
+        this.recalc();
+      });
+      setInterval(() => this.loadOrderbook(), 5000);
+    },
+
+    _parseBook(raw) {
+      let cumBid = 0, cumAsk = 0;
+      const maxBidQty = Math.max(...(raw.bids||[]).map(b => b.quantity), 1);
+      const maxAskQty = Math.max(...(raw.asks||[]).map(a => a.quantity), 1);
+      const bids = (raw.bids || []).map(b => {
+        cumBid += b.quantity;
+        return { ...b, cumQty: cumBid, pct: (b.quantity / maxBidQty * 100) };
+      });
+      const asks = (raw.asks || []).map(a => {
+        cumAsk += a.quantity;
+        return { ...a, cumQty: cumAsk, pct: (a.quantity / maxAskQty * 100) };
+      });
+      return { bids, asks, spread: raw.spread || 0, bidDepth: cumBid, askDepth: cumAsk, imbalance: cumAsk > 0 ? cumBid / cumAsk : 0 };
+    },
+
+    async loadOrderbook() {
+      try {
+        const resp = await fetch('/api/v1/orderbook');
+        const data = await resp.json();
+        // UP
+        const up = this._parseBook(data.up || data);
+        this.upBids = up.bids; this.upAsks = up.asks;
+        this.upSpread = up.spread; this.upBidDepth = up.bidDepth; this.upAskDepth = up.askDepth; this.upImbalance = up.imbalance;
+        // DOWN
+        if (data.down) {
+          const dn = this._parseBook(data.down);
+          this.downBids = dn.bids; this.downAsks = dn.asks;
+          this.downSpread = dn.spread; this.downBidDepth = dn.bidDepth; this.downAskDepth = dn.askDepth; this.downImbalance = dn.imbalance;
+        }
+      } catch (e) {}
+    },
+
+    async loadTrades() {
+      try {
+        const resp = await fetch('/api/v1/trades');
+        const data = await resp.json();
+        this.trades = data.trades || [];
+        this.total = data.total || this.trades.length;
+        this.recalc();
+      } catch (e) {}
+    },
+
+    recalc() {
+      const wins = this.trades.filter(t => (t.pnl || 0) > 0);
+      const losses = this.trades.filter(t => (t.pnl || 0) < 0);
+      this.totalPnl = this.trades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+      this.winRate = this.trades.length > 0 ? wins.length / this.trades.length * 100 : 0;
+      const totalWin = wins.reduce((s, t) => s + t.pnl, 0);
+      const totalLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+      this.profitFactor = totalLoss > 0 ? totalWin / totalLoss : totalWin > 0 ? Infinity : 0;
+    },
+  };
+}
+</script>
+{% endblock %}

@@ -1,0 +1,33 @@
+# ============================
+# 策略配置: 动量策略
+# ============================
+strategy:
+  name: "momentum_5min"
+  module: src.strategy.templates.builtin
+  class: MomentumStrategy
+  enabled: false
+
+  params:
+    # 动量指标
+    momentum_period: 10         # 动量回溯周期(K线根数)
+    momentum_threshold: 0.3     # 动量阈值 (%)
+
+    # RSI 过滤
+    rsi_period: 14
+    rsi_overbought: 70
+    rsi_oversold: 30
+
+    # 下注参数
+    bet_amount: 10.0            # 单笔下注金额 (USDC)
+    direction: "auto"           # auto / yes / no
+
+  # 运行参数
+  market_id: ""                 # Polymarket 市场 ID, 留空表示运行时指定
+  interval: "5m"                # 关注的 K 线周期
+  cooldown_seconds: 300         # 两笔交易之间最短间隔
+
+  # 限制条件
+  constraints:
+    min_liquidity: 500          # 市场最低流动性 (USDC)
+    min_volume_24h: 1000        # 24h 最低成交量
+    max_spread_pct: 5.0         # 最大买卖价差 (%)

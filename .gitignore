@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+
+# 数据
+data/
+logs/
+reports/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 密钥 (重要!)
+.env
+*.keyfile
+*.pem
+*.key
+config/settings.yaml
+
+# Temp / debug files
+_*.py
+_*.txt
+temp_*.txt
+cache_result.txt
+clob_result.txt
+*.bak
+*.log
+analyze_0x1d_*.py
+test_rtds.py
+
+# diskcache
+cache/

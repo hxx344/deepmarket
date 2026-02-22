@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}行情中心{% endblock %}
+{% block page_title %}行情中心{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <!-- ═══ PM 市场信息 ═══ -->
+  <div class="card py-2 px-4 mb-4" x-show="pmQuestion">
+    <p class="text-xs text-gray-400">
+      <span class="text-brand-500 font-semibold">PM 5min 市场:</span>
+      <span x-text="pmQuestion" class="text-gray-300"></span>
+      <span class="ml-3 text-yellow-400 font-mono" x-show="pmSecondsLeft > 0"
+            x-text="'⏱ ' + formatCountdown(pmSecondsLeft)"></span>
+    </p>
+  </div>
+
+  <!-- ═══ 价格概要 ═══ -->
+  <div class="grid grid-cols-2 sm:grid-cols-5 gap-4">
+    <div class="card py-3">
+      <p class="stat-label">BTC/USD <span class="text-gray-600 normal-case">(Chainlink)</span></p>
+      <p class="text-xl font-bold font-mono"
+         :class="priceDirection > 0 ? 'text-up' : priceDirection < 0 ? 'text-down' : 'text-white'"
+         x-text="formatUSD(btcPrice)">$0.00</p>
+      <p class="text-xs mt-1"
+         x-show="btcPriceAge > 10"
+         :class="btcPriceAge > 60 ? 'text-red-400' : 'text-yellow-500'"
+         x-text="'Oracle \u66f4\u65b0 ' + (btcPriceAge > 60 ? Math.floor(btcPriceAge/60) + 'm' : btcPriceAge + 's') + ' \u524d'"></p>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">PM UP <span class="text-gray-600 normal-case">(Mid)</span></p>
+      <p class="text-xl font-bold"
+         :class="pmYesPrice > 0 ? 'text-up' : 'text-gray-500'"
+         x-text="pmYesPrice > 0 ? '$' + pmYesPrice.toFixed(4) : '搜索中...'">$0.00</p>
+      <div class="flex justify-between text-xs mt-1 font-mono">
+        <span class="text-green-400" x-text="pmYesBid > 0 ? 'Bid ' + pmYesBid.toFixed(4) : ''"></span>
+        <span class="text-red-400" x-text="pmYesAsk > 0 ? 'Ask ' + pmYesAsk.toFixed(4) : ''"></span>
+      </div>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">PM DOWN <span class="text-gray-600 normal-case">(Mid)</span></p>
+      <p class="text-xl font-bold"
+         :class="pmNoPrice > 0 ? 'text-down' : 'text-gray-500'"
+         x-text="pmNoPrice > 0 ? '$' + pmNoPrice.toFixed(4) : '搜索中...'">$0.00</p>
+      <div class="flex justify-between text-xs mt-1 font-mono">
+        <span class="text-green-400" x-text="pmNoBid > 0 ? 'Bid ' + pmNoBid.toFixed(4) : ''"></span>
+        <span class="text-red-400" x-text="pmNoAsk > 0 ? 'Ask ' + pmNoAsk.toFixed(4) : ''"></span>
+      </div>
+    </div>
+    <div class="card py-3">
+      <p class="stat-label">窗口倒计时</p>
+      <p class="text-xl font-bold font-mono"
+         :class="pmSecondsLeft < 30 ? 'text-red-400' : 'text-yellow-400'"
+         x-text="pmSecondsLeft > 0 ? formatCountdown(pmSecondsLeft) : '--:--'">--:--</p>
+    </div>
+    <div class="card py-3" x-data="{ ticks: 0, rate: 0 }" x-init="
+      window.addEventListener('dash:price', () => ticks++);
+      setInterval(() => { rate = ticks; ticks = 0; }, 1000);
+    ">
+      <p class="stat-label">Ticks/s</p>
+      <p class="text-xl font-bold text-yellow-400" x-text="rate">0</p>
+    </div>
+  </div>
+
+  <!-- ═══ 实时 tick 图 + 成交流 ═══ -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <!-- 实时 Tick -->
+    <div class="card">
+      <h3 class="text-sm font-semibold text-gray-300 mb-3">实时价格 Tick</h3>
+      <div id="market-tick-chart" style="height: 250px;"></div>
+    </div>
+
+    <!-- 最近成交 -->
+    <div class="card">
+      <h3 class="text-sm font-semibold text-gray-300 mb-3">PM 最近成交</h3>
+      <div x-data="{ pmTrades: [] }" x-init="
+        window.addEventListener('dash:pm_trade', e => {
+          pmTrades.unshift(e.detail.data);
+          if (pmTrades.length > 20) pmTrades.pop();
+        });
+      ">
+        <div class="overflow-y-auto" style="max-height: 250px;">
+          <table class="w-full text-xs">
+            <thead class="text-gray-500 border-b border-gray-700/50">
+              <tr>
+                <th class="text-left py-1">方向</th>
+                <th class="text-right py-1">价格</th>
+                <th class="text-right py-1">数量</th>
+                <th class="text-right py-1">时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-if="pmTrades.length === 0">
+                <tr><td colspan="4" class="text-center py-4 text-gray-500">等待成交数据...</td></tr>
+              </template>
+              <template x-for="t in pmTrades" :key="t.id || Math.random()">
+                <tr class="border-b border-gray-700/20">
+                  <td :class="t.side === 'buy' ? 'text-up' : 'text-down'" x-text="t.side?.toUpperCase()"></td>
+                  <td class="text-right font-mono" x-text="Number(t.price || 0).toFixed(4)"></td>
+                  <td class="text-right font-mono" x-text="Number(t.size || t.quantity || 0).toFixed(2)"></td>
+                  <td class="text-right text-gray-500" x-text="t.timestamp ? new Date(t.timestamp*1000).toLocaleTimeString() : ''"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let tickChart, tickSeries;
+
+document.addEventListener('alpine:init', () => {
+  setTimeout(() => {
+    // Tick 实时线图
+    const tickEl = document.getElementById('market-tick-chart');
+    if (tickEl) {
+      const res = createLineChart(tickEl);
+      tickChart = res.chart;
+      tickSeries = res.lineSeries;
+
+      const addTick = throttle((price) => {
+        tickSeries.update({ time: Math.floor(Date.now() / 1000), value: price });
+      }, 500);
+
+      // 监听实时价格
+      window.addEventListener('dash:price', (e) => {
+        const price = e.detail?.data?.price;
+        if (price > 0) addTick(price);
+      });
+
+      // 监听历史回放 (新连接时一次性接收)
+      window.addEventListener('dash:price_history', (e) => {
+        const prices = e.detail?.data?.prices;
+        if (prices && prices.length > 0) {
+          // 去重+排序后 setData
+          const seen = new Set();
+          const sorted = prices
+            .filter(p => { if (seen.has(p.time)) return false; seen.add(p.time); return true; })
+            .sort((a, b) => a.time - b.time);
+          tickSeries.setData(sorted);
+        }
+      });
+
+      new ResizeObserver(() => {
+        tickChart.applyOptions({ width: tickEl.clientWidth });
+      }).observe(tickEl);
+    }
+  }, 300);
+});
+</script>
+{% endblock %}

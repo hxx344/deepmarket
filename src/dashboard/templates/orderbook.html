@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block title %}订单簿{% endblock %}
+{% block page_title %}订单簿{% endblock %}
+
+{% block content %}
+<div class="space-y-6" x-data="orderbookPage()" x-init="init()">
+
+  <!-- 订单簿: 左UP 右DOWN，上Asks 下Bids，中间价格 -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <!-- UP 订单簿 -->
+    <div class="card px-0 py-0 overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-2 border-b border-gray-700/40">
+        <h3 class="text-sm font-semibold text-gray-200">UP 订单簿</h3>
+        <div class="flex gap-3 text-xs text-gray-500">
+          <span>B <span class="text-up font-mono" x-text="formatUSD(upBidDepth)"></span></span>
+          <span>S <span class="text-down font-mono" x-text="formatUSD(upAskDepth)"></span></span>
+        </div>
+      </div>
+      <table class="w-full text-xs font-mono">
+        <thead class="text-gray-500">
+          <tr class="border-b border-gray-700/30">
+            <th class="text-left py-1 pl-4">价格</th>
+            <th class="text-right py-1">数量</th>
+            <th class="text-right py-1 pr-4">累计</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="(a, i) in upAsksReversed" :key="'ua'+i">
+            <tr class="h-6" :style="'background:linear-gradient(to left,rgba(239,68,68,0.1) '+(a.pct||0)+'%,transparent '+(a.pct||0)+'%)'">
+              <td class="text-down pl-4" x-text="a.price.toFixed(4)"></td>
+              <td class="text-right" x-text="a.quantity.toFixed(2)"></td>
+              <td class="text-right text-gray-500 pr-4" x-text="a.cumQty?.toFixed(2) || ''"></td>
+            </tr>
+          </template>
+          <tr class="h-8 border-y border-gray-600/40">
+            <td colspan="3" class="text-center">
+              <span class="text-base font-bold font-mono"
+                    :class="upBids[0]?.price > 0 ? 'text-white' : 'text-gray-500'"
+                    x-text="upBids[0]?.price > 0 ? ((upBids[0].price + (upAsks.length ? upAsks[0].price : upBids[0].price)) / 2).toFixed(4) : '--'"></span>
+              <span class="text-xs text-yellow-400 ml-2" x-text="upSpread > 0 ? '↔ ' + upSpread.toFixed(4) : ''"></span>
+              <span class="text-xs ml-2">
+                <span class="text-up" x-text="'B ' + ((upBidDepth/(upBidDepth+upAskDepth))*100 || 0).toFixed(0) + '%'"></span>
+                <span class="text-down ml-1" x-text="'S ' + ((upAskDepth/(upBidDepth+upAskDepth))*100 || 0).toFixed(0) + '%'"></span>
+              </span>
+            </td>
+          </tr>
+          <template x-for="(b, i) in upBidsDisplay" :key="'ub'+i">
+            <tr class="h-6" :style="'background:linear-gradient(to left,rgba(34,197,94,0.1) '+(b.pct||0)+'%,transparent '+(b.pct||0)+'%)'">
+              <td class="text-up pl-4" x-text="b.price.toFixed(4)"></td>
+              <td class="text-right" x-text="b.quantity.toFixed(2)"></td>
+              <td class="text-right text-gray-500 pr-4" x-text="b.cumQty?.toFixed(2) || ''"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- DOWN 订单簿 -->
+    <div class="card px-0 py-0 overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-2 border-b border-gray-700/40">
+        <h3 class="text-sm font-semibold text-gray-200">DOWN 订单簿</h3>
+        <div class="flex gap-3 text-xs text-gray-500">
+          <span>B <span class="text-up font-mono" x-text="formatUSD(downBidDepth)"></span></span>
+          <span>S <span class="text-down font-mono" x-text="formatUSD(downAskDepth)"></span></span>
+        </div>
+      </div>
+      <table class="w-full text-xs font-mono">
+        <thead class="text-gray-500">
+          <tr class="border-b border-gray-700/30">
+            <th class="text-left py-1 pl-4">价格</th>
+            <th class="text-right py-1">数量</th>
+            <th class="text-right py-1 pr-4">累计</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="(a, i) in downAsksReversed" :key="'da'+i">
+            <tr class="h-6" :style="'background:linear-gradient(to left,rgba(239,68,68,0.1) '+(a.pct||0)+'%,transparent '+(a.pct||0)+'%)'">
+              <td class="text-down pl-4" x-text="a.price.toFixed(4)"></td>
+              <td class="text-right" x-text="a.quantity.toFixed(2)"></td>
+              <td class="text-right text-gray-500 pr-4" x-text="a.cumQty?.toFixed(2) || ''"></td>
+            </tr>
+          </template>
+          <tr class="h-8 border-y border-gray-600/40">
+            <td colspan="3" class="text-center">
+              <span class="text-base font-bold font-mono"
+                    :class="downBids[0]?.price > 0 ? 'text-white' : 'text-gray-500'"
+                    x-text="downBids[0]?.price > 0 ? ((downBids[0].price + (downAsks.length ? downAsks[0].price : downBids[0].price)) / 2).toFixed(4) : '--'"></span>
+              <span class="text-xs text-yellow-400 ml-2" x-text="downSpread > 0 ? '↔ ' + downSpread.toFixed(4) : ''"></span>
+              <span class="text-xs ml-2">
+                <span class="text-up" x-text="'B ' + ((downBidDepth/(downBidDepth+downAskDepth))*100 || 0).toFixed(0) + '%'"></span>
+                <span class="text-down ml-1" x-text="'S ' + ((downAskDepth/(downBidDepth+downAskDepth))*100 || 0).toFixed(0) + '%'"></span>
+              </span>
+            </td>
+          </tr>
+          <template x-for="(b, i) in downBidsDisplay" :key="'db'+i">
+            <tr class="h-6" :style="'background:linear-gradient(to left,rgba(34,197,94,0.1) '+(b.pct||0)+'%,transparent '+(b.pct||0)+'%)'">
+              <td class="text-up pl-4" x-text="b.price.toFixed(4)"></td>
+              <td class="text-right" x-text="b.quantity.toFixed(2)"></td>
+              <td class="text-right text-gray-500 pr-4" x-text="b.cumQty?.toFixed(2) || ''"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 深度图 -->
+  <div class="card">
+    <h3 class="text-sm font-semibold text-gray-300 mb-3">深度图</h3>
+    <div id="depth-chart" style="height: 300px;"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function orderbookPage() {
+  return {
+    upBids: [], upAsks: [], upSpread: 0, upImbalance: 0, upBidDepth: 0, upAskDepth: 0,
+    downBids: [], downAsks: [], downSpread: 0, downImbalance: 0, downBidDepth: 0, downAskDepth: 0,
+    get upAsksReversed() { return [...this.upAsks].slice(0, 15).reverse(); },
+    get upBidsDisplay() { return this.upBids.slice(0, 15); },
+    get downAsksReversed() { return [...this.downAsks].slice(0, 15).reverse(); },
+    get downBidsDisplay() { return this.downBids.slice(0, 15); },
+
+    async init() {
+      await this.load();
+      window.addEventListener('dash:orderbook', () => this.load());
+      setInterval(() => this.load(), 5000);
+    },
+
+    _parseBook(raw) {
+      let cumBid = 0, cumAsk = 0;
+      const maxBidQty = Math.max(...(raw.bids||[]).map(b => b.quantity), 1);
+      const maxAskQty = Math.max(...(raw.asks||[]).map(a => a.quantity), 1);
+      const bids = (raw.bids || []).map(b => {
+        cumBid += b.quantity;
+        return { ...b, cumQty: cumBid, pct: (b.quantity / maxBidQty * 100) };
+      });
+      const asks = (raw.asks || []).map(a => {
+        cumAsk += a.quantity;
+        return { ...a, cumQty: cumAsk, pct: (a.quantity / maxAskQty * 100) };
+      });
+      return { bids, asks, spread: raw.spread || 0, bidDepth: cumBid, askDepth: cumAsk, imbalance: cumAsk > 0 ? cumBid / cumAsk : 0 };
+    },
+
+    async load() {
+      try {
+        const resp = await fetch('/api/v1/orderbook');
+        const data = await resp.json();
+        // UP
+        const up = this._parseBook(data.up || data);
+        this.upBids = up.bids; this.upAsks = up.asks;
+        this.upSpread = up.spread; this.upBidDepth = up.bidDepth; this.upAskDepth = up.askDepth; this.upImbalance = up.imbalance;
+        // DOWN
+        if (data.down) {
+          const dn = this._parseBook(data.down);
+          this.downBids = dn.bids; this.downAsks = dn.asks;
+          this.downSpread = dn.spread; this.downBidDepth = dn.bidDepth; this.downAskDepth = dn.askDepth; this.downImbalance = dn.imbalance;
+        }
+      } catch (e) {}
+    },
+  };
+}
+</script>
+{% endblock %}

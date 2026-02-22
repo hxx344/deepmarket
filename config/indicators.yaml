@@ -1,0 +1,71 @@
+# ============================
+# 指标配置
+# ============================
+# 通过此文件控制加载哪些指标及其参数。
+# 也可以通过 PluginManager 动态注册自定义指标。
+
+indicators:
+  # --- 技术指标 ---
+  - module: src.market.indicators.technical
+    class: SMAIndicator
+    params:
+      period: 5
+
+  - module: src.market.indicators.technical
+    class: SMAIndicator
+    params:
+      period: 10
+
+  - module: src.market.indicators.technical
+    class: SMAIndicator
+    params:
+      period: 20
+
+  - module: src.market.indicators.technical
+    class: EMAIndicator
+    params:
+      period: 5
+
+  - module: src.market.indicators.technical
+    class: EMAIndicator
+    params:
+      period: 10
+
+  - module: src.market.indicators.technical
+    class: EMAIndicator
+    params:
+      period: 20
+
+  - module: src.market.indicators.technical
+    class: RSIIndicator
+    params:
+      period: 14
+
+  - module: src.market.indicators.technical
+    class: MACDIndicator
+    params:
+      fast: 12
+      slow: 26
+      signal: 9
+
+  - module: src.market.indicators.technical
+    class: BollingerBandsIndicator
+    params:
+      period: 20
+      std_dev: 2.0
+
+  - module: src.market.indicators.technical
+    class: ATRIndicator
+    params:
+      period: 14
+
+  - module: src.market.indicators.technical
+    class: VWAPIndicator
+
+  - module: src.market.indicators.technical
+    class: OBVIndicator
+
+  - module: src.market.indicators.technical
+    class: MomentumIndicator
+    params:
+      period: 10

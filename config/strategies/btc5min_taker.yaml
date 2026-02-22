@@ -1,0 +1,72 @@
+# ============================
+# 策略配置: BTC 5-min Dual-Side Event-Driven Taker v5.3
+# 模拟 0x1d 账号 event-driven burst+pause 模式
+# ============================
+strategy:
+  name: "btc5min_taker"
+  module: src.strategy.templates.btc5min_taker
+  class: BTC5minTakerStrategy
+  enabled: false
+
+  params:
+    # ── 核心 (双边 shares 目标) ──
+    target_shares_per_side: 100.0   # 每边目标 shares 总量
+    shares_per_order: 10.0          # 每笔下单 shares 数
+    max_combined_cost: 500.0        # 每窗口总投入上限 (USDC)
+
+    # ── 动量触发 (放宽的 lead-lag 阈值) ──
+    momentum_lookback_s: 5.0        # 动量回看窗口 (秒)
+    momentum_threshold: 1.0         # 触发阈值 (放宽: $1 vs 原 $3)
+    strong_momentum: 5.0            # 强动量触发全量 burst
+
+    # ── Burst 模式 (模拟 0x1d 多档吃单) ──
+    max_burst_orders: 5             # 单次 burst 最大订单数 (0x1d: 5-15/s)
+    burst_cooldown_s: 0.3           # burst 内订单间隔 (模拟吃多档)
+    post_burst_pause_s: 2.0         # burst 之间暂停 (等 OB 恢复, 0x1d: ~2s)
+
+    # ── 时间窗口 ──
+    entry_delay_s: 9.0              # 窗口开始后延迟 (秒)
+    entry_cutoff_s: 15.0            # 窗口结束前停止 (秒)
+
+    # ── Gap 自然平衡 (不再是机械交替) ──
+    gap_weight_factor: 0.7          # gap 修正强度: 0=不修, 1=全修
+
+    # ── 时间衰减 Gap 控制 (窗口后期限制加仓方向) ──
+    time_decay_enabled: true        # 是否启用时间衰减
+    time_decay_start_pct: 0.3       # 窗口过了30%后开始衰减
+    time_decay_power: 2.0           # 衰减曲线指数 (越大后期越陡)
+    time_decay_floor: 0.1           # 加仓方向最低缩放因子 (10%)
+    time_decay_rebalance_boost: 1.5 # 平仓方向最大放大因子 (150%)
+
+    # ── 震荡防护 (Choppiness Guard) ──
+    chop_guard_enabled: true        # 启用震荡市场过滤
+    chop_lookback_s: 30.0           # 回看窗口: 统计零轴穿越次数
+    chop_max_crosses: 6             # 穿越阈值: 30s 内 >6 次 = 震荡
+    chop_cooldown_s: 15.0           # 触发后冷却时间 (秒)
+    max_entries_per_window: 20      # 单窗口最大入场次数硬上限
+    min_momentum_consistency: 3     # 动量方向连续同符号最少 tick 数
+
+    # ── 价格保护 (Price Guard) ──
+    min_edge: -0.02                 # 最低 edge门槛: UP_ask+DN_ask ≤ 1.02
+    price_deterioration_pct: 0.08   # 均价恶化上限: ask > avg*(1+8%) → 拒绝
+
+    # ── 流动性 ──
+    min_depth: 50.0                 # 对手盘最低深度 (USDC)
+    max_spread: 0.20                # 最大 spread (20%)
+
+    # ── 出场 ──
+    hold_to_settlement: true        # 持有至结算
+
+    # ── 手续费 ──
+    fee_rate: 0.002                 # Taker 手续费 0.2%
+
+  # ── 运行参数 ──
+  market_id: ""                     # 运行时自动发现
+  interval: "5m"
+  cooldown_seconds: 0
+
+  # ── 约束 ──
+  constraints:
+    min_liquidity: 200              # USDC
+    min_volume_24h: 1000
+    max_spread_pct: 5.0

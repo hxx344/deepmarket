@@ -1,0 +1,68 @@
+# ============================
+# 策略配置: BN-RTDS Spread Lead-Lag v1.0
+# 利用 Binance (领先) 与 RTDS/Chainlink (滞后) 价差信号
+# 驱动 Polymarket BTC 5-min Up/Down 双边下注
+# ============================
+strategy:
+  name: "bn_rtds_spread"
+  module: src.strategy.templates.bn_rtds_spread
+  class: BnRtdsSpreadStrategy
+  enabled: true
+
+  params:
+    # ── 核心仓位 ──
+    target_shares_per_side: 100.0   # 每边目标 shares 总量
+    shares_per_order: 10.0          # 每笔基础下单 shares 数
+    max_combined_cost: 500.0        # 每窗口总投入上限 (USDC)
+
+    # ── Spread 计算 (EMA 参数) ──
+    spread_fast_halflife_s: 3.0     # fast EMA 半衰期 (秒), 捕捉快速波动
+    spread_slow_halflife_s: 30.0    # slow EMA 半衰期 (秒), 作为均值基准
+    spread_buffer_size: 1200        # spread 原始数据缓冲区大小
+
+    # ── 信号阈值 ──
+    open_threshold: 2.0             # 偏离触发阈值 ($), BN-RTDS 偏离超此值产生信号
+    revert_threshold: 0.5           # 回归触发阈值 ($), 偏离回归至此值内触发反向信号
+    strong_deviation: 5.0           # 强偏离 ($), 触发加量
+    extreme_deviation: 8.0          # 极端偏离 ($), 最大加量
+
+    # ── 分段倍率 (按偏离强度分 3 档) ──
+    stage_multipliers:              # [小偏离, 中偏离, 大偏离] 的下单倍率
+      - 1.0                         # open_threshold ~ strong_deviation
+      - 1.5                         # strong_deviation ~ extreme_deviation
+      - 2.0                         # >= extreme_deviation
+
+    # ── 冷却 ──
+    signal_cooldown_s: 1.0          # 同方向信号最小间隔 (秒)
+    burst_cooldown_s: 0.3           # burst 内订单间隔
+    post_trade_pause_s: 2.0         # 交易后暂停 (等 OB 恢复)
+
+    # ── 时间窗口 ──
+    entry_delay_s: 9.0              # 窗口开始后延迟 (秒), 等 spread 数据稳定
+    entry_cutoff_s: 15.0            # 窗口结束前停止 (秒)
+
+    # ── Gap 平衡 (UP/DOWN 持仓差权重) ──
+    gap_weight_factor: 0.8          # 持仓差修正强度: 0=不修, 1=全修
+                                    # 落后方加量, 领先方减量
+                                    # 目标: 5-min 结束时 UP/DOWN shares 大致均衡
+
+    # ── 流动性 ──
+    min_depth: 50.0                 # 对手盘最低深度 (USDC)
+    max_spread: 0.20                # 最大 spread (20%)
+
+    # ── 出场 ──
+    hold_to_settlement: true        # 持有至结算
+
+    # ── 手续费 ──
+    fee_rate: 0.002                 # Taker 手续费 0.2%
+
+  # ── 运行参数 ──
+  market_id: ""                     # 运行时自动发现
+  interval: "5m"
+  cooldown_seconds: 0
+
+  # ── 约束 ──
+  constraints:
+    min_liquidity: 200              # USDC
+    min_volume_24h: 1000
+    max_spread_pct: 5.0
