@@ -1705,8 +1705,9 @@ async def poll_0x1d_activity():
                             trade_elapsed = ts_int - state.window_start_ts if state.window_start_ts > 0 else 0
                             elapsed_pct = trade_elapsed / 300 * 100 if trade_elapsed >= 0 else 0
                             # 仓位
+                            net_shares = state.cum_up_shares - state.cum_dn_shares  # 原始差值
                             total_shares = max(state.cum_up_shares, state.cum_dn_shares, 1)
-                            pos_imbalance = (state.cum_up_shares - state.cum_dn_shares) / total_shares
+                            pos_imbalance = net_shares / total_shares
                             # 下单速度 (最近 30s 内的交易数 / 0.5min)
                             recent_cnt = sum(1 for t in state.trades_0x1d if t.get("ts", 0) > ts_int - 30)
                             trade_velocity = recent_cnt * 2  # per minute
@@ -1918,6 +1919,7 @@ async def poll_0x1d_activity():
                                 "mom_accel_30s": round(mom_accel_30s, 2),
                                 "bn_mom_accel_10s": round(bn_mom_accel_10s, 2),
                                 # 仓位细节
+                                "net_shares": round(net_shares, 2),  # UP-DN 原始差值
                                 "cum_up_shares": round(state.cum_up_shares, 2),
                                 "cum_dn_shares": round(state.cum_dn_shares, 2),
                                 "cum_up_cost":   round(state.cum_up_cost, 2),

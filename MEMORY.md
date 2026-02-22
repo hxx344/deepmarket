@@ -57,7 +57,8 @@
 - **PM盘口** (8): bid/ask/spread/edge
 - **窗口** (2): elapsed, elapsed_pct
 - **时间** (6): hour_utc, minute_utc, day_of_week, us_session, asia_session, euro_session
-- **持仓/元数据** (若干): cum_shares, streak, burst 等 (蒸馏时排除)
+- **持仓/行为** (17): net_shares, cum_shares, pos_imbalance, streak, burst, velocity, price_vs_fair 等
+- **Burst聚合** (4): burst_n_fills, burst_total_shares, burst_total_usdc, burst_avg_price
 
 ### Binance 域名
 - 默认使用 `data-stream.binance.vision` / `data-api.binance.vision`
@@ -74,7 +75,15 @@
 - **思路**: 每笔交易 = 一个决策样本，学习交易方向
 - **样本**: 13,403 笔交易 → 突发聚类 → ~2,600 决策点
 - **标签**: side (UP=1, DOWN=0)
-- **特征**: 仅纯市场状态 (58个，排除持仓/累计)
+- **特征**: 78个，分为 12 组:
+  - 市场状态 (58): BN动量/波动率/高级 + CL动量/波动率/高级 + 跨源 + PM盘口 + 窗口 + 时间
+  - 持仓行为 (16): net_shares, cum_trades/shares/cost, avg_price, pos_imbalance, streak, velocity, burst_seq/is_burst, price_vs_fair
+  - Burst聚合 (4): burst_n_fills, burst_total_shares, burst_total_usdc, burst_avg_price
+- **Burst 去重逻辑**:
+  - 市场特征取首笔 (决策瞬间的市场快照)
+  - 持仓特征取末笔 (扫单完成后的持仓状态)
+  - 新增 burst_n_fills/total_shares/total_usdc/avg_price (反映扫单力度)
+  - 核心: 连续同向多笔可能是一个信号扫多个档口，不是多次信号
 - **验证**: GroupKFold 按窗口分组
 - **结果** (5小时完整数据):
   - CV Acc = 57.2%, AUC = 0.606

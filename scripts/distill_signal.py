@@ -118,23 +118,45 @@ TIME_FEATURES = [
     "asia_session",    # 亚盘 (UTC 0-8)
     "euro_session",    # 欧盘 (UTC 7-16)
 ]
+# 持仓/行为特征 (推理时 bot 自身可追踪)
+POSITION_BEHAVIOR = [
+    "net_shares",          # UP-DN 原始 shares 差值 (绝对量, 不归一化)
+    "cum_trades",          # 当前窗口累计交易笔数
+    "cum_up_shares",       # UP 累计 shares
+    "cum_dn_shares",       # DOWN 累计 shares
+    "cum_up_cost",         # UP 累计成本 USDC
+    "cum_dn_cost",         # DOWN 累计成本 USDC
+    "avg_up_price",        # UP 平均成交价
+    "avg_dn_price",        # DOWN 平均成交价
+    "pos_imbalance",       # 仓位偏差 (UP-DN)/max(UP,DN)
+    "same_side_streak",    # 连续同向笔数 (正=UP, 负=DN)
+    "trade_velocity",      # 交易速度 (笔/窗口进度)
+    "time_since_last",     # 距上笔交易秒数
+    "burst_seq",           # 突发序号 (1s内连续交易)
+    "is_burst",            # 是否突发交易
+    "up_price_vs_fair",    # UP 价格 vs 公平价偏差
+    "dn_price_vs_fair",    # DN 价格 vs 公平价偏差
+]
+# Burst 聚合特征 (去重时由多笔交易聚合生成, 反映单次决策的扫单力度)
+BURST_AGGREGATE = [
+    "burst_n_fills",       # 本次决策的成交笔数 (1=单档, >1=扫多档)
+    "burst_total_shares",  # 本次决策总 shares
+    "burst_total_usdc",    # 本次决策总 USDC
+    "burst_avg_price",     # 本次决策加权均价 (usdc/shares)
+]
 
 # 全部信号特征
 SIGNAL_FEATURES = (
     BN_MOMENTUM + BN_VOLATILITY + BN_ADVANCED +
     CL_MOMENTUM + CL_VOLATILITY + CL_ADVANCED +
-    CROSS_SOURCE + PM_ORDERBOOK + WINDOW_CONTEXT + TIME_FEATURES
+    CROSS_SOURCE + PM_ORDERBOOK + WINDOW_CONTEXT + TIME_FEATURES +
+    POSITION_BEHAVIOR + BURST_AGGREGATE
 )
 
-# 排除的特征 (持仓/累计/元数据 — 推理时不可用或会造成泄漏)
+# 排除的特征 (纯元数据/标签 — 推理时无意义)
 EXCLUDED = [
-    "side", "shares", "price",
-    "cum_trades", "cum_up_cost", "cum_dn_cost", "cum_up_shares", "cum_dn_shares",
-    "avg_up_price", "avg_dn_price", "pos_imbalance",
-    "same_side_streak", "trade_velocity", "time_since_last",
-    "burst_seq", "is_burst",
-    "dn_price_vs_fair", "up_price_vs_fair",
-    "ref_ts", "feature_latency", "ts_source",
+    "side", "shares", "price",     # 标签和成交细节
+    "ref_ts", "feature_latency", "ts_source",  # 调试元数据
 ]
 
 
@@ -184,7 +206,12 @@ def deduplicate_bursts(df: pd.DataFrame, gap_sec: int = 3) -> pd.DataFrame:
     """
     将连续的同方向交易聚合为一个「决策点」:
     - 同窗口 + 同方向 + 时间间隔 < gap_sec → 视为同一次入场决策
-    - 保留首笔交易的市场特征, 聚合 shares/usdc
+    - 市场特征: 取首笔 (决策瞬间的市场快照)
+    - 持仓特征: 取末笔 (扫单完成后的持仓状态)
+    - 新增 burst 聚合特征: 笔数/总shares/总usdc/均价 (反映扫单力度)
+
+    核心逻辑: 0x1d 一次下单可能扫多个档口 → CLOB 记录多笔 fill,
+    但这是一个信号, 不是多个信号。模型需要感知「单档 vs 多档扫单」。
     """
     df = df.sort_values(["slug", "side", "ts"]).reset_index(drop=True)
 
@@ -196,7 +223,7 @@ def deduplicate_bursts(df: pd.DataFrame, gap_sec: int = 3) -> pd.DataFrame:
     )
     df["burst_id"] = new_burst.cumsum()
 
-    # 聚合
+    # ── 基础聚合 ──
     agg = df.groupby("burst_id").agg(
         ts=("ts", "first"),
         slug=("slug", "first"),
@@ -207,14 +234,40 @@ def deduplicate_bursts(df: pd.DataFrame, gap_sec: int = 3) -> pd.DataFrame:
         has_ref_ts=("has_ref_ts", "first"),
     ).reset_index(drop=True)
 
-    # 取每个 burst 首笔交易的市场特征
+    # ── 市场特征: 取首笔交易 (决策瞬间的市场快照) ──
+    # 这些特征在决策那一刻就已确定, 不受后续 fill 影响
+    MARKET_FEATURES = (
+        BN_MOMENTUM + BN_VOLATILITY + BN_ADVANCED +
+        CL_MOMENTUM + CL_VOLATILITY + CL_ADVANCED +
+        CROSS_SOURCE + PM_ORDERBOOK + WINDOW_CONTEXT + TIME_FEATURES
+    )
     first_idx = df.groupby("burst_id").head(1).index
-    feat_df = df.loc[first_idx, SIGNAL_FEATURES].reset_index(drop=True)
-    result = pd.concat([agg, feat_df], axis=1)
+    market_df = df.loc[first_idx, [f for f in MARKET_FEATURES if f in df.columns]].reset_index(drop=True)
+
+    # ── 持仓特征: 取末笔交易 (扫单完成后的持仓状态) ──
+    # 推理时 bot 也是等 burst 结束后才知道最终持仓
+    last_idx = df.groupby("burst_id").tail(1).index
+    pos_cols = [f for f in POSITION_BEHAVIOR if f in df.columns]
+    pos_df = df.loc[last_idx, pos_cols].reset_index(drop=True)
+
+    # ── Burst 聚合特征 (新增: 反映扫单强度) ──
+    burst_agg = df.groupby("burst_id").agg(
+        burst_n_fills=("ts", "count"),                      # 扫了几个档
+        burst_total_shares=("shares", "sum"),                # 总 shares
+        burst_total_usdc=("usdc", "sum"),                    # 总 USDC
+    ).reset_index(drop=True)
+    # 加权均价 = usdc / shares
+    burst_agg["burst_avg_price"] = (
+        burst_agg["burst_total_usdc"] / burst_agg["burst_total_shares"].replace(0, np.nan)
+    ).round(4)
+
+    result = pd.concat([agg, market_df, pos_df, burst_agg], axis=1)
 
     ratio = len(df) / len(result) if len(result) > 0 else 0
+    multi_fill = (result.burst_n_fills > 1).sum()
     print(f"\n突发聚类: {len(df)} 笔交易 → {len(result)} 个决策点 (压缩 {ratio:.1f}x)")
-    print(f"  平均 burst 大小: {result.n_trades.mean():.1f} 笔, ${result.usdc.mean():.1f}")
+    print(f"  单档成交: {len(result) - multi_fill} | 多档扫单: {multi_fill} ({multi_fill/len(result)*100:.1f}%)")
+    print(f"  平均 burst 大小: {result.burst_n_fills.mean():.1f} 笔, ${result.burst_total_usdc.mean():.1f}")
     return result
 
 
