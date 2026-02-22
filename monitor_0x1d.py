@@ -42,8 +42,12 @@ ADDR_0X1D = "0x1d0034134e339a309700ff2d34e99fa2d48b0313"
 ACTIVITY_API = "https://data-api.polymarket.com/activity"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_REST = "https://clob.polymarket.com"
-BINANCE_WS = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-BINANCE_REST = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+# Binance 域名 (可通过环境变量覆盖, 应对地区封锁)
+# 备选: stream.binance.us / data-stream.binance.vision
+_BN_HOST = os.environ.get("BN_HOST", "stream.binance.com")
+_BN_API  = os.environ.get("BN_API",  "api.binance.com")
+BINANCE_WS = f"wss://{_BN_HOST}:9443/ws/btcusdt@trade"
+BINANCE_REST = f"https://{_BN_API}/api/v3/ticker/price?symbol=BTCUSDT"
 PM_RTDS_WS = "wss://ws-live-data.polymarket.com"
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
