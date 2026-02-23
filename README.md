@@ -324,6 +324,137 @@ class MyStrategy(Strategy):
 
 ---
 
+## 🧠 策略蒸馏 (Strategy Distillation)
+
+通过监控面板 (`monitor_0x1d.py`) 持续采集 0x1d 的交易快照和结算数据，用机器学习模型逆向学习其交易决策模式。提供两套互补的蒸馏程序：
+
+### 前置条件
+
+1. **数据采集**：确保 `monitor_0x1d.py` 已运行并积累足够数据（推荐 ≥7 天）
+2. **数据来源**：SQLite 数据库 `data/0x1d_data.db`（表 `trade_snaps` + `settlements`）
+3. **依赖安装**：
+
+```bash
+pip install lightgbm scikit-learn pandas numpy
+```
+
+### 程序 1: 窗口级蒸馏 (`distill_0x1d.py`)
+
+从窗口维度学习 0x1d 的决策，训练 **4 个独立模型**：
+
+| 模型 | 文件 | 说明 |
+|------|------|------|
+| 方向模型 | `direction_model.pkl` | 预测 0x1d 在窗口内主买 UP 还是 DOWN |
+| 交易质量 | `trade_quality_model.pkl` | 每笔交易是否与最终赢面方向一致 |
+| 仓位模型 | `sizing_model.pkl` | 预测每笔下单的 shares 数量 |
+| 盈亏预测 | `pnl_model.pkl` | 预测窗口盈亏方向（赚/亏） |
+
+```bash
+# 完整训练 + 评估 (4 个模型)
+python scripts/distill_0x1d.py
+
+# 只查看数据质量报告 (不训练)
+python scripts/distill_0x1d.py --report
+```
+
+**输出示例**：
+```
+模型 1: 方向预测 (Direction)
+  样本: 120, 特征: 35
+  交叉验证准确率: 0.683 ± 0.045
+  Top-10 重要特征:
+    first_bn_mom_5s                          142
+    first_cl_trend_30s                       128
+    ...
+蒸馏完成
+  方向模型     ✓                    12KB
+  交易质量     ✓                    18KB
+  仓位模型     ✓                    15KB
+  盈亏预测     ✓                     9KB
+```
+
+### 程序 2: 实时信号蒸馏 (`distill_signal.py`)
+
+从每笔交易维度学习 0x1d 的入场时机和方向，生成一个**实时信号生成器**：
+
+- **输入**：当前市场状态（BTC 动量/波动率/趋势 + CL-BN 价差 + PM 盘口）
+- **输出**：`UP` / `DOWN` / `HOLD` 信号 + 置信度
+
+```bash
+# 完整训练 + 评估 + 信号回测
+python scripts/distill_signal.py
+
+# 只看特征分析报告
+python scripts/distill_signal.py --report
+
+# 自定义信号阈值 (默认 0.60)
+python scripts/distill_signal.py --threshold 0.65
+
+# 仅用有 ref_ts 的高质量数据 (时间戳更精确)
+python scripts/distill_signal.py --rich-only
+```
+
+**产出文件**：
+
+| 文件 | 说明 |
+|------|------|
+| `data/distill_models/signal_model.pkl` | LightGBM 模型 |
+| `data/distill_models/signal_config.json` | 特征列表 + 信号阈值 |
+
+**训练流程**：
+1. 加载交易数据 → 突发聚类（Burst Dedup: 1s 内同向交易合并为一个决策点）
+2. 特征分析（Cohen's d 区分度排序）
+3. GroupKFold CV 训练（按窗口分组，无时间泄漏）
+4. 多阈值信号分析 → 自动选最优阈值
+5. 信号回测 + 与真实结算对比
+
+**推理代码示例**：
+```python
+import pickle, json, numpy as np
+
+model = pickle.load(open('data/distill_models/signal_model.pkl', 'rb'))
+cfg = json.load(open('data/distill_models/signal_config.json'))
+threshold = cfg['threshold']
+
+# 从实时数据源采集特征
+features = collect_market_features()  # BN WebSocket + CL RTDS + PM API
+x = np.array([[features[f] for f in cfg['features']]])
+
+prob_up = model.predict_proba(x)[0, 1]
+if prob_up > threshold:
+    signal, conf = 'UP', prob_up
+elif prob_up < (1 - threshold):
+    signal, conf = 'DOWN', 1 - prob_up
+else:
+    signal, conf = 'HOLD', 0.5
+
+print(f'Signal: {signal} (confidence: {conf:.1%})')
+```
+
+### 两套蒸馏的区别
+
+| 维度 | `distill_0x1d.py` | `distill_signal.py` |
+|------|--------------------|----------------------|
+| 粒度 | 窗口级（每 5-min 窗口一个样本） | 交易级（每笔交易一个样本） |
+| 样本量 | 较少（~百级） | 较多（~千级） |
+| 用途 | 策略逆向分析、盈亏预测 | **实时信号生成**、替代手工规则 |
+| 核心产出 | 4 个分析模型 | 1 个生产可用的信号模型 |
+
+### 推荐工作流
+
+```
+1. 运行 monitor_0x1d.py 持续采集数据（≥7 天）
+2. python scripts/distill_0x1d.py --report    # 查看数据质量
+3. python scripts/distill_0x1d.py             # 训练窗口级模型
+4. python scripts/distill_signal.py           # 训练实时信号模型
+5. 数据增长后定期重新训练
+6. 将 signal_model 集成到交易机器人
+```
+
+模型文件统一保存在 `data/distill_models/` 目录下。
+
+---
+
 ## ⚠️ 免责声明
 
 - 本系统仅供学习和研究用途

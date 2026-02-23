@@ -310,6 +310,12 @@ class MonitorState:
         self.btc_source: str = "---"           # 当前 BTC 价源: "Chainlink" / "Binance"
         self.rtds_last_obs_ts: int = 0         # 最近 observationsTimestamp
         self.ptb_source: str = "---"           # PTB 来源: "Chainlink obs" / "Binance buffer"
+        # RTDS 连接健康度追踪
+        self.rtds_connect_ts: float = 0.0      # 本次连接建立时间
+        self.rtds_last_pong_ts: float = 0.0    # 最近一次 pong 响应时间
+        self.rtds_last_data_ts: float = 0.0    # 最近一次收到 BTC 数据的时间
+        self.rtds_reconnect_count: int = 0     # 累计重连次数
+        self.rtds_total_uptime: float = 0.0    # 累计在线时长 (秒)
 
         # 连接状态
         self.binance_connected: bool = False
@@ -952,6 +958,11 @@ class MonitorState:
             "pm_ok": self.pm_connected,
             "activity_ok": self.activity_connected,
             "rtds_ok": self.rtds_connected,
+            "rtds_reconnects": self.rtds_reconnect_count,
+            "rtds_uptime": round(self.rtds_total_uptime + (
+                (time.time() - self.rtds_connect_ts) if self.rtds_connected and self.rtds_connect_ts > 0 else 0
+            )),
+            "rtds_last_data_age": round(time.time() - self.rtds_last_data_ts, 1) if self.rtds_last_data_ts > 0 else -1,
             "clob_ws_ok": self.clob_ws_connected,
             "btc_source": self.btc_source,
             "ptb_source": self.ptb_source,
@@ -1100,12 +1111,80 @@ def _parse_rtds_price(raw: str) -> list[tuple[float, float]]:
     return results
 
 
+RTDS_PING_INTERVAL = 10       # 客户端主动 ping 间隔 (秒)
+RTDS_DATA_TIMEOUT  = 15       # 无 BTC 数据超时 → 断开重连 (秒)
+RTDS_PONG_TIMEOUT  = 8        # ping 后未收到 pong → 判定连接死亡 (秒)
+RTDS_BOUNDARY_WARN = 20       # 边界前 N 秒若 RTDS 不健康则告警
+
+
+async def _rtds_ping_loop(ws: aiohttp.ClientWebSocketResponse):
+    """后台 ping 保活: 每 RTDS_PING_INTERVAL 秒发送 ping 帧,
+    并检测 pong 响应是否超时。如果超时直接关闭 ws 触发重连。"""
+    while not ws.closed:
+        try:
+            await ws.ping()
+            await asyncio.sleep(RTDS_PING_INTERVAL)
+            # 检查 pong 是否在超时时间内回复
+            if state.rtds_last_pong_ts > 0:
+                pong_age = time.time() - state.rtds_last_pong_ts
+                if pong_age > RTDS_PING_INTERVAL + RTDS_PONG_TIMEOUT:
+                    print(
+                        f"[Chainlink RTDS] pong 超时 "
+                        f"({pong_age:.1f}s > {RTDS_PING_INTERVAL + RTDS_PONG_TIMEOUT}s), "
+                        f"关闭连接触发重连"
+                    )
+                    await ws.close()
+                    return
+        except (asyncio.CancelledError, Exception):
+            return
+
+
+async def _rtds_boundary_watchdog():
+    """边界看门狗: 在每个 5-min 边界前 RTDS_BOUNDARY_WARN 秒检查 RTDS 健康度。
+    如果此时 RTDS 不在线, 打印告警以便排查结算来源降级。"""
+    while True:
+        try:
+            now = time.time()
+            now_int = int(now)
+            next_boundary = now_int - (now_int % 300) + 300
+            secs_to_boundary = next_boundary - now
+            # 睡到边界前 RTDS_BOUNDARY_WARN 秒
+            if secs_to_boundary > RTDS_BOUNDARY_WARN:
+                await asyncio.sleep(secs_to_boundary - RTDS_BOUNDARY_WARN)
+            # 检查 RTDS 健康
+            if not state.rtds_connected:
+                print(
+                    f"[RTDS 边界告警] 距下一个 5-min 边界仅 "
+                    f"{RTDS_BOUNDARY_WARN}s, 但 RTDS 未连接! "
+                    f"(重连次数={state.rtds_reconnect_count})"
+                )
+            elif state.rtds_last_data_ts > 0:
+                data_age = time.time() - state.rtds_last_data_ts
+                if data_age > 10:
+                    print(
+                        f"[RTDS 边界告警] 距下一个 5-min 边界仅 "
+                        f"{RTDS_BOUNDARY_WARN}s, RTDS 已 {data_age:.0f}s 无数据!"
+                    )
+            # 睡到边界后再循环
+            await asyncio.sleep(RTDS_BOUNDARY_WARN + 2)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(5)
+
+
 async def chainlink_rtds_stream():
     """
     连接 PM RTDS WebSocket 获取 Chainlink BTC/USD 实时价格。
     这是 Polymarket 结算使用的价格源, 与 Binance BTC/USDT 有微小差异。
 
     PTB 捕获: 当 observationsTimestamp % 300 == 0 时, 该价格即为窗口基准价。
+
+    保活机制:
+      - aiohttp heartbeat=5s (库级 ping/pong)
+      - 客户端主动 ping 每 10s + pong 超时检测
+      - 数据看门狗 15s 无 BTC 数据 → 断开重连
+      - 边界看门狗: 5-min 边界前 20s 检查健康度
     """
     fail_count = 0
     while True:
@@ -1115,6 +1194,8 @@ async def chainlink_rtds_stream():
                     PM_RTDS_WS,
                     heartbeat=5.0,
                     timeout=aiohttp.ClientTimeout(total=15),
+                    autoping=True,       # 自动回复服务器 ping
+                    autoclose=False,     # 手动控制关闭, 避免静默断连
                 ) as ws:
                     # 订阅 crypto_prices_chainlink (无 filters, 客户端过滤 btc/usd)
                     await ws.send_json({
@@ -1128,64 +1209,93 @@ async def chainlink_rtds_stream():
                     })
                     state.rtds_connected = True
                     state.btc_source = "Chainlink"
+                    state.rtds_connect_ts = time.time()
+                    state.rtds_last_pong_ts = time.time()  # 初始化
                     fail_count = 0
-                    print("[Chainlink RTDS] WebSocket 已连接, 订阅 crypto_prices_chainlink")
+                    if state.rtds_reconnect_count > 0:
+                        print(
+                            f"[Chainlink RTDS] WebSocket 已重连 "
+                            f"(累计重连 {state.rtds_reconnect_count} 次), "
+                            f"订阅 crypto_prices_chainlink"
+                        )
+                    else:
+                        print("[Chainlink RTDS] WebSocket 已连接, 订阅 crypto_prices_chainlink")
 
                     last_data_time = time.time()
 
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            prices = _parse_rtds_price(msg.data)
-                            if prices:
-                                last_data_time = time.time()
-                            for price, obs_ts in prices:
-                                now = time.time()
-                                state.btc_price = price
-                                state.rtds_last_obs_ts = int(obs_ts)
+                    # 启动后台 ping 保活协程
+                    ping_task = asyncio.create_task(_rtds_ping_loop(ws))
 
-                                # 写入价格缓冲区 (用 observationsTimestamp)
-                                state.btc_price_buffer.append((obs_ts, price))
-                                # 降采样 UI 历史
-                                if (not state.btc_history
-                                        or now - state.btc_history[-1]["ts"] >= BTC_DOWNSAMPLE_INTERVAL):
-                                    state.btc_history.append({"ts": now, "price": price})
+                    try:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                prices = _parse_rtds_price(msg.data)
+                                if prices:
+                                    last_data_time = time.time()
+                                    state.rtds_last_data_ts = time.time()
+                                for price, obs_ts in prices:
+                                    now = time.time()
+                                    state.btc_price = price
+                                    state.rtds_last_obs_ts = int(obs_ts)
 
-                                # ━━ PTB 精确捕获 + RTDS 即时结算 ━━
-                                # Chainlink observationsTimestamp % 300 == 0 → 窗口基准价
-                                # 该价格同时是旧窗口的结算价 + 新窗口的开盘价
-                                obs_ts_int = int(obs_ts)
-                                if obs_ts_int % 300 == 0 and obs_ts_int > 0:
-                                    old_ptb = state.window_ptb
+                                    # 写入价格缓冲区 (用 observationsTimestamp)
+                                    state.btc_price_buffer.append((obs_ts, price))
+                                    # 降采样 UI 历史
+                                    if (not state.btc_history
+                                            or now - state.btc_history[-1]["ts"] >= BTC_DOWNSAMPLE_INTERVAL):
+                                        state.btc_history.append({"ts": now, "price": price})
 
-                                    # ── 保存边界信息 (供窗口切换时即时结算) ──
-                                    # 必须在覆写 window_ptb 之前保存!
-                                    state._rtds_boundary = {
-                                        "settle_price": price,
-                                        "old_ptb": old_ptb,
-                                        "obs_ts": obs_ts_int,
-                                        "at": time.time(),
-                                    }
+                                    # ━━ PTB 精确捕获 + RTDS 即时结算 ━━
+                                    # Chainlink observationsTimestamp % 300 == 0 → 窗口基准价
+                                    # 该价格同时是旧窗口的结算价 + 新窗口的开盘价
+                                    obs_ts_int = int(obs_ts)
+                                    if obs_ts_int % 300 == 0 and obs_ts_int > 0:
+                                        old_ptb = state.window_ptb
 
-                                    # ── 旧窗口即时结算 (如果 _pending_settle 已存在) ──
-                                    if state._pending_settle:
-                                        settle_ptb = state._pending_settle["ptb"] or old_ptb
-                                        _do_settle(price, settle_ptb, "RTDS")
+                                        # ── 保存边界信息 (供窗口切换时即时结算) ──
+                                        # 必须在覆写 window_ptb 之前保存!
+                                        state._rtds_boundary = {
+                                            "settle_price": price,
+                                            "old_ptb": old_ptb,
+                                            "obs_ts": obs_ts_int,
+                                            "at": time.time(),
+                                        }
 
-                                    # ── 新窗口 PTB ──
-                                    state.window_ptb = price
-                                    state.ptb_source = "Chainlink obs"
-                                    print(
-                                        f"[Chainlink RTDS] PTB 捕获 "
-                                        f"(observationsTimestamp={obs_ts_int}): "
-                                        f"${price:,.2f} (旧=${old_ptb:,.2f})"
-                                    )
-                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                            break
+                                        # ── 旧窗口即时结算 (如果 _pending_settle 已存在) ──
+                                        if state._pending_settle:
+                                            settle_ptb = state._pending_settle["ptb"] or old_ptb
+                                            _do_settle(price, settle_ptb, "RTDS")
 
-                        # 静默看门狗: 30s 无 BTC 数据 → 断开重连
-                        if time.time() - last_data_time > 30:
-                            print("[Chainlink RTDS] 30s 无数据, 断开重连...")
-                            break
+                                        # ── 新窗口 PTB ──
+                                        state.window_ptb = price
+                                        state.ptb_source = "Chainlink obs"
+                                        print(
+                                            f"[Chainlink RTDS] PTB 捕获 "
+                                            f"(observationsTimestamp={obs_ts_int}): "
+                                            f"${price:,.2f} (旧=${old_ptb:,.2f})"
+                                        )
+                            elif msg.type == aiohttp.WSMsgType.PONG:
+                                state.rtds_last_pong_ts = time.time()
+                            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                                print(
+                                    f"[Chainlink RTDS] WS 收到 {msg.type.name}, "
+                                    f"本次在线 {time.time() - state.rtds_connect_ts:.0f}s"
+                                )
+                                break
+
+                            # 数据看门狗: RTDS_DATA_TIMEOUT 秒无 BTC 数据 → 断开重连
+                            if time.time() - last_data_time > RTDS_DATA_TIMEOUT:
+                                print(
+                                    f"[Chainlink RTDS] {RTDS_DATA_TIMEOUT}s 无数据, "
+                                    f"断开重连 (本次在线 {time.time() - state.rtds_connect_ts:.0f}s)"
+                                )
+                                break
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
 
         except asyncio.CancelledError:
             break
@@ -1193,12 +1303,19 @@ async def chainlink_rtds_stream():
             fail_count += 1
             print(f"[Chainlink RTDS] 连接异常 ({fail_count}): {e}")
 
+        # 记录本次连接时长
+        if state.rtds_connect_ts > 0:
+            session_dur = time.time() - state.rtds_connect_ts
+            state.rtds_total_uptime += session_dur
         state.rtds_connected = False
+        state.rtds_reconnect_count += 1
         # 降级: RTDS 断了, Binance 仍然在作为备用数据源运行
         if state.binance_connected:
             state.btc_source = "Binance"
-        print("[Chainlink RTDS] 5s 后重连...")
-        await asyncio.sleep(5)
+        # 自适应重连: 首次 1s, 连续失败逐步增加到 10s
+        backoff = min(1 + fail_count * 2, 10)
+        print(f"[Chainlink RTDS] {backoff}s 后重连 (累计重连 {state.rtds_reconnect_count} 次)...")
+        await asyncio.sleep(backoff)
 
 
 # ─────────────────────────────────────────────────────────
@@ -2243,6 +2360,7 @@ async def start_server(port: int):
 
     tasks = [
         asyncio.create_task(_safe("chainlink_rtds", chainlink_rtds_stream())),
+        asyncio.create_task(_safe("rtds_boundary_wd", _rtds_boundary_watchdog())),
         asyncio.create_task(_safe("binance_btc", binance_btc_stream())),
         asyncio.create_task(_safe("pm_price", pm_price_loop())),
         asyncio.create_task(_safe("clob_trade", clob_trade_stream())),

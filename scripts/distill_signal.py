@@ -20,6 +20,8 @@
   python scripts/distill_signal.py --report       # 只看数据分析
   python scripts/distill_signal.py --threshold 0.65  # 自定义信号阈值
   python scripts/distill_signal.py --rich-only    # 仅用有ref_ts的高质量数据
+  python scripts/distill_signal.py --pure-market  # 仅用纯市场特征 (排除持仓/行为)
+  python scripts/distill_signal.py --compare      # 对比全特征 vs 纯市场特征
 
 产出:
   data/distill_models/signal_model.pkl     — LightGBM 模型
@@ -145,12 +147,20 @@ BURST_AGGREGATE = [
     "burst_avg_price",     # 本次决策加权均价 (usdc/shares)
 ]
 
-# 全部信号特征
+# 全部信号特征 (含持仓/行为特征)
 SIGNAL_FEATURES = (
     BN_MOMENTUM + BN_VOLATILITY + BN_ADVANCED +
     CL_MOMENTUM + CL_VOLATILITY + CL_ADVANCED +
     CROSS_SOURCE + PM_ORDERBOOK + WINDOW_CONTEXT + TIME_FEATURES +
     POSITION_BEHAVIOR + BURST_AGGREGATE
+)
+
+# 纯市场特征 (排除持仓/行为/burst — 避免自相关泄漏)
+# 这些特征仅依赖外部市场数据, 不依赖 0x1d 自身的交易行为
+PURE_MARKET_FEATURES = (
+    BN_MOMENTUM + BN_VOLATILITY + BN_ADVANCED +
+    CL_MOMENTUM + CL_VOLATILITY + CL_ADVANCED +
+    CROSS_SOURCE + PM_ORDERBOOK + WINDOW_CONTEXT + TIME_FEATURES
 )
 
 # 排除的特征 (纯元数据/标签 — 推理时无意义)
@@ -317,18 +327,21 @@ def analyze_features(df: pd.DataFrame) -> list:
 # 4. 模型训练
 # ══════════════════════════════════════════════════════════════
 
-def train_signal_model(df: pd.DataFrame, threshold: float = 0.60):
+def train_signal_model(df: pd.DataFrame, threshold: float = 0.60,
+                       feature_set: list | None = None,
+                       label: str = "全特征"):
     """
     训练实时入场信号模型:
-      - 输入: 纯市场状态特征
+      - 输入: 市场状态特征 (可选排除持仓特征)
       - 输出: P(UP), 用阈值分为 UP / DOWN / HOLD
       - 验证: GroupKFold (按窗口分组, 无时间泄漏)
     """
+    features = feature_set or SIGNAL_FEATURES
     print("\n" + "=" * 72)
-    print("  训练: 实时入场信号模型")
+    print(f"  训练: 实时入场信号模型 [{label}] ({len(features)} 特征)")
     print("=" * 72)
 
-    X = df[SIGNAL_FEATURES].copy()
+    X = df[features].copy()
     y = (df["side"] == "UP").astype(int)       # 1=UP, 0=DOWN
     groups = df["slug"]                         # 按窗口分组
 
@@ -446,7 +459,7 @@ def train_signal_model(df: pd.DataFrame, threshold: float = 0.60):
 
     # ── 特征重要性 ──
     imp = pd.DataFrame({
-        "feature": SIGNAL_FEATURES,
+        "feature": features,
         "importance": final_model.feature_importances_,
     }).sort_values("importance", ascending=False)
 
@@ -470,6 +483,8 @@ def train_signal_model(df: pd.DataFrame, threshold: float = 0.60):
         "fold_metrics": fold_metrics,
         "all_probs": all_probs,
         "feature_importance": imp,
+        "features_used": features,
+        "label": label,
     }
 
 
@@ -683,8 +698,11 @@ def save_model(model, eval_results: dict, threshold: float):
     with open(model_path, "wb") as f:
         pickle.dump(model, f)
 
+    features_used = eval_results.get("features_used", SIGNAL_FEATURES)
+    model_label = eval_results.get("label", "全特征")
+
     config = {
-        "features": SIGNAL_FEATURES,
+        "features": list(features_used),
         "feature_groups": {
             "bn_momentum": BN_MOMENTUM,
             "bn_volatility": BN_VOLATILITY,
@@ -700,7 +718,9 @@ def save_model(model, eval_results: dict, threshold: float):
         "cv_accuracy": eval_results["cv_acc"],
         "cv_auc": eval_results["cv_auc"],
         "cv_f1": eval_results["cv_f1"],
-        "n_features": len(SIGNAL_FEATURES),
+        "n_features": len(features_used),
+        "model_type": model_label,
+        "pure_market": "持仓" not in model_label,
         "excluded_features": EXCLUDED,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -750,6 +770,8 @@ def main():
     # ── 参数解析 ──
     report_only = "--report" in sys.argv
     rich_only = "--rich-only" in sys.argv
+    pure_market = "--pure-market" in sys.argv
+    compare_mode = "--compare" in sys.argv
     threshold = 0.60
     for i, arg in enumerate(sys.argv):
         if arg == "--threshold" and i + 1 < len(sys.argv):
@@ -761,6 +783,10 @@ def main():
     print("=" * 72)
     if rich_only:
         print("  [模式] 仅使用有 ref_ts 的高质量数据")
+    if pure_market:
+        print("  [模式] 纯市场特征 (排除持仓/行为/burst 自相关特征)")
+    if compare_mode:
+        print("  [模式] 对比: 全特征 vs 纯市场特征")
 
     # ── 加载数据 ──
     df = load_trades(rich_only=rich_only)
@@ -775,8 +801,69 @@ def main():
         print("\n[--report 模式, 跳过训练]")
         return
 
-    # ── 训练模型 ──
-    model, eval_results = train_signal_model(df, threshold=threshold)
+    # ── 对比模式: 同时训练两个模型 ──
+    if compare_mode:
+        print("\n" + "#" * 72)
+        print("#  对比模式: 全特征 vs 纯市场特征")
+        print("#" * 72)
+
+        m_all, r_all = train_signal_model(
+            df, threshold=threshold,
+            feature_set=SIGNAL_FEATURES, label="全特征(含持仓)"
+        )
+        m_pure, r_pure = train_signal_model(
+            df, threshold=threshold,
+            feature_set=PURE_MARKET_FEATURES, label="纯市场特征"
+        )
+
+        # 对比汇总
+        print("\n" + "=" * 72)
+        print("  对比结果: 全特征 vs 纯市场特征")
+        print("=" * 72)
+        print(f"{'指标':<16} {'全特征(含持仓)':>16} {'纯市场特征':>16} {'差异':>10}")
+        print("-" * 60)
+        for metric, key in [("CV 准确率", "cv_acc"), ("CV AUC", "cv_auc"), ("CV F1", "cv_f1")]:
+            v_all = r_all[key]
+            v_pure = r_pure[key]
+            diff = v_pure - v_all
+            print(f"  {metric:<14} {v_all:>16.4f} {v_pure:>16.4f} {diff:>+10.4f}")
+        print(f"  {'特征数':<14} {len(SIGNAL_FEATURES):>16} {len(PURE_MARKET_FEATURES):>16}")
+        print(f"  {'最佳阈值':<14} {r_all['best_threshold']:>16.2f} {r_pure['best_threshold']:>16.2f}")
+
+        # Top 特征对比
+        print(f"\n  全特征 Top-10:")
+        for _, row in r_all["feature_importance"].head(10).iterrows():
+            leaked = " ⚠ 自相关" if row["feature"] in POSITION_BEHAVIOR + BURST_AGGREGATE else ""
+            print(f"    {row['feature']:<32} {row['importance']:>6.0f}{leaked}")
+        print(f"\n  纯市场 Top-10:")
+        for _, row in r_pure["feature_importance"].head(10).iterrows():
+            print(f"    {row['feature']:<32} {row['importance']:>6.0f}")
+
+        print(f"\n  结论:")
+        if r_pure["cv_acc"] >= r_all["cv_acc"] - 0.01:
+            print(f"  ✓ 纯市场特征效果相当或更好 — 持仓特征是噪声/自相关, 可安全移除")
+        elif r_pure["cv_acc"] >= 0.52:
+            print(f"  ◐ 纯市场特征有轻微下降但仍有信号 — 建议使用纯市场模型(更可靠)")
+        else:
+            print(f"  ✗ 纯市场特征效果显著下降 — 当前数据中市场特征区分度不足")
+            print(f"    建议: 积累更多数据 / 增加新特征维度 (如 orderbook depth, funding rate)")
+
+        # 保存纯市场模型为主模型
+        print(f"\n  保存纯市场模型作为生产模型...")
+        save_model(m_pure, r_pure, r_pure["best_threshold"])
+        return
+
+    # ── 常规训练 ──
+    if pure_market:
+        features = PURE_MARKET_FEATURES
+        label = "纯市场特征"
+    else:
+        features = SIGNAL_FEATURES
+        label = "全特征(含持仓)"
+
+    model, eval_results = train_signal_model(
+        df, threshold=threshold, feature_set=features, label=label
+    )
 
     # ── 信号回测 ──
     best_t = eval_results.get("best_threshold", threshold)
@@ -791,6 +878,7 @@ def main():
     # ── 总结 ──
     print("\n" + "=" * 72)
     print("  训练完成!")
+    print(f"  模式:      {label}")
     print(f"  CV 准确率: {eval_results['cv_acc']:.4f} (随机基准: 0.5000)")
     print(f"  CV AUC:    {eval_results['cv_auc']:.4f}")
     print(f"  最佳阈值:  {best_t:.2f}")
@@ -798,9 +886,13 @@ def main():
     print(f"              P(UP) < {1-best_t:.2f} → 买DOWN")
     print(f"              其余 → HOLD (不交易)")
     print("=" * 72)
+    if not pure_market:
+        print("\n  ⚠ 注意: 当前使用全特征(含持仓), Top特征可能是自相关而非市场信号")
+        print("  建议运行: python scripts/distill_signal.py --compare")
+        print("  或直接:   python scripts/distill_signal.py --pure-market")
     print("\n  下一步:")
     print("  1. 让 monitor_0x1d.py 持续运行收集更多数据 (目标: 7天+)")
-    print("  2. 数据增加后重新训练: python scripts/distill_signal.py")
+    print("  2. 数据增加后重新训练: python scripts/distill_signal.py --pure-market")
     print("  3. 将模型集成到交易机器人, 替代手工规则")
 
 
