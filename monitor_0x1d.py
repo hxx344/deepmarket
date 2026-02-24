@@ -322,6 +322,9 @@ class MonitorState:
         self.pm_connected: bool = False
         self.activity_connected: bool = False
 
+        # 预热标志: 启动时若处于窗口中间, 等到下一个窗口再正式统计
+        self.warmup: bool = True
+
         # WebSocket 客户端
         self.ws_clients: set[aiohttp.web.WebSocketResponse] = set()
 
@@ -1262,6 +1265,7 @@ class MonitorState:
             "btc_source": self.btc_source,
             "ptb_source": self.ptb_source,
             "clob_trades_buf": len(self.clob_trades),
+            "warmup": self.warmup,
         }
 
 
@@ -1785,7 +1789,11 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
 
     def _fallback_switch():
         """Gamma API 不可用/返回空时, 至少基于时间切换窗口slug"""
-        if state.window_slug and state.trade_count_window > 0:
+        if state.warmup:
+            # 预热期结束: 跳过首个不完整窗口的结算
+            print(f"[预热] 预热结束 (丢弃不完整窗口: trades={state.trade_count_window}), 正式开始统计")
+            state.warmup = False
+        elif state.window_slug and state.trade_count_window > 0:
             saved_ptb = _resolve_ptb(state.window_end_ts)
             state._pending_settle = {
                 "slug": state.window_slug,
@@ -1852,23 +1860,28 @@ async def discover_pm_window(session: aiohttp.ClientSession) -> bool:
             if up_idx < 0 or dn_idx < 0:
                 return False
 
-            # ── 旧窗口结算 (立即结算, 不等待 RTDS) ──
+            # ── 旧窗口结算 ──
             if state.window_slug and state.window_slug != slug:
-                saved_ptb = _resolve_ptb(state.window_end_ts)
-                state._pending_settle = {
-                    "slug": state.window_slug,
-                    "question": state.window_question,
-                    "end_ts": state.window_end_ts,
-                    "ptb": saved_ptb,
-                    "cum_up_shares": state.cum_up_shares,
-                    "cum_dn_shares": state.cum_dn_shares,
-                    "cum_up_cost": state.cum_up_cost,
-                    "cum_dn_cost": state.cum_dn_cost,
-                    "trade_count": state.trade_count_window,
-                    "end_up_price": state.up_price,
-                    "end_dn_price": state.dn_price,
-                }
-                _settle_pending()
+                if state.warmup:
+                    # 预热期结束: 跳过首个不完整窗口的结算
+                    print(f"[预热] 预热结束 (丢弃不完整窗口: trades={state.trade_count_window}), 正式开始统计")
+                    state.warmup = False
+                elif state.trade_count_window > 0:
+                    saved_ptb = _resolve_ptb(state.window_end_ts)
+                    state._pending_settle = {
+                        "slug": state.window_slug,
+                        "question": state.window_question,
+                        "end_ts": state.window_end_ts,
+                        "ptb": saved_ptb,
+                        "cum_up_shares": state.cum_up_shares,
+                        "cum_dn_shares": state.cum_dn_shares,
+                        "cum_up_cost": state.cum_up_cost,
+                        "cum_dn_cost": state.cum_dn_cost,
+                        "trade_count": state.trade_count_window,
+                        "end_up_price": state.up_price,
+                        "end_dn_price": state.dn_price,
+                    }
+                    _settle_pending()
 
             state.window_slug = slug
             state.window_question = mkt.get("question", "")
@@ -2204,7 +2217,10 @@ async def poll_0x1d_activity():
                                     if ts_from_slug > (state.window_start_ts or 0):
                                         print(f"[Activity] ⚡ 检测到新窗口 (交易驱动切换): {slug}")
                                         # 保存旧窗口到 pending settle
-                                        if state.window_slug and state.trade_count_window > 0:
+                                        if state.warmup:
+                                            print(f"[预热] 预热结束 (丢弃不完整窗口: trades={state.trade_count_window}), 正式开始统计")
+                                            state.warmup = False
+                                        elif state.window_slug and state.trade_count_window > 0:
                                             saved_ptb = _resolve_ptb(state.window_end_ts)
                                             state._pending_settle = {
                                                 "slug": state.window_slug,
@@ -2670,8 +2686,10 @@ async def periodic_summary():
         # ── BTC 价格 ──
         btc_str = f"${state.btc_price:,.2f}" if state.btc_price else "N/A"
 
+        warmup_str = " [预热中]" if state.warmup else ""
+
         print(
-            f"[摘要] 连接: {conn_str} | "
+            f"[摘要]{warmup_str} 连接: {conn_str} | "
             f"BTC={btc_str} | "
             f"数据: RTDS={btc_n} BN={bn_n} PM={pm_n} 交易={trades_n} CLOB={clob_n} | "
             f"窗口交易={win_trades} 已结算={settled_n}{rtds_uptime}{rtds_recon}"
@@ -2761,6 +2779,10 @@ async def start_server(port: int):
     db_stats = _db_get_stats()
     print(f"  数据库: {db_stats['trade_snaps']} 条交易快照, {db_stats['settlements']} 条结算")
     print(f"  特征数: {len(MonitorState.FEATURE_DEFS)} 个 (策略蒸馏用)")
+    # 计算距下一个 5-min 窗口的秒数
+    _now_ts = int(time.time())
+    _secs_to_next = 300 - (_now_ts % 300)
+    print(f"  预热: 等待下一个5min窗口 ({_secs_to_next}s后) 再正式统计")
     print(f"{'='*60}\n")
 
     # 启动所有数据采集任务
