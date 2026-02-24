@@ -2667,11 +2667,21 @@ async def periodic_summary():
 
         warmup_str = " [预热中]" if state.warmup else ""
 
+        # ── PnL 统计 ──
+        pnl_str = ""
+        if state.settled_windows:
+            pnls = [w["pnl"] for w in state.settled_windows]
+            total_pnl = sum(pnls)
+            wins = sum(1 for p in pnls if p > 0)
+            win_rate = wins / len(pnls) * 100
+            avg_pnl = total_pnl / len(pnls)
+            pnl_str = f" | PnL=${total_pnl:+.2f} 胜率={win_rate:.0f}% 均值=${avg_pnl:+.2f}"
+
         print(
             f"[摘要]{warmup_str} 连接: {conn_str} | "
             f"BTC={btc_str} | "
             f"数据: RTDS={btc_n} BN={bn_n} PM={pm_n} 交易={trades_n} CLOB={clob_n} | "
-            f"窗口交易={win_trades} 已结算={settled_n}{rtds_uptime}{rtds_recon}"
+            f"窗口交易={win_trades} 已结算={settled_n}{pnl_str}{rtds_uptime}{rtds_recon}"
         )
 
         await asyncio.sleep(SUMMARY_INTERVAL)
