@@ -1,7 +1,7 @@
 # ============================
-# 策略配置: BN-RTDS Spread Lead-Lag v1.0
-# 利用 Binance (领先) 与 RTDS/Chainlink (滞后) 价差信号
-# 驱动 Polymarket BTC 5-min Up/Down 双边下注
+# 策略配置: BN-RTDS Direction Conviction v2.1
+# 利用 Binance (领先) 与 RTDS/Chainlink (滞后) 价差偏离度
+# 结合 BTC vs PTB 双信号确认 + 震荡过滤, 单边方向累积持仓
 # ============================
 strategy:
   name: "bn_rtds_spread"
@@ -11,9 +11,13 @@ strategy:
 
   params:
     # ── 核心仓位 ──
-    target_shares_per_side: 100.0   # 每边目标 shares 总量
+    target_shares_per_side: 100.0   # 每边目标 shares 总量 (参考值)
     shares_per_order: 10.0          # 每笔基础下单 shares 数
-    max_combined_cost: 500.0        # 每窗口总投入上限 (USDC)
+    max_combined_cost: 250.0        # 每窗口总投入上限 (USDC)
+
+    # ── 价格过滤 (v2.0) ──
+    max_buy_price: 0.62             # 买入价上限, 避免买贵的 shares (EV 保护)
+    cheap_price: 0.35               # 低价对冲阈值, 对面 ask < 此值时少量对冲
 
     # ── Spread 计算 (EMA 参数) ──
     spread_fast_halflife_s: 3.0     # fast EMA 半衰期 (秒), 捕捉快速波动
@@ -21,9 +25,9 @@ strategy:
     spread_buffer_size: 1200        # spread 原始数据缓冲区大小
 
     # ── 信号阈值 ──
-    open_threshold: 2.0             # 偏离触发阈值 ($), BN-RTDS 偏离超此值产生信号
-    revert_threshold: 0.5           # 回归触发阈值 ($), 偏离回归至此值内触发反向信号
-    strong_deviation: 5.0           # 强偏离 ($), 触发加量
+    open_threshold: 3.0             # 偏离触发阈值 ($), 双信号确认后入场
+    revert_threshold: 0.5           # 回归阈值 ($), 回归时仅切 IDLE 不交易
+    strong_deviation: 5.0           # 强偏离 ($), 无需双信号确认即可入场
     extreme_deviation: 8.0          # 极端偏离 ($), 最大加量
 
     # ── 分段倍率 (按偏离强度分 3 档) ──
@@ -41,10 +45,16 @@ strategy:
     entry_delay_s: 9.0              # 窗口开始后延迟 (秒), 等 spread 数据稳定
     entry_cutoff_s: 15.0            # 窗口结束前停止 (秒)
 
-    # ── Gap 平衡 (UP/DOWN 持仓差权重) ──
-    gap_weight_factor: 0.8          # 持仓差修正强度: 0=不修, 1=全修
-                                    # 落后方加量, 领先方减量
-                                    # 目标: 5-min 结束时 UP/DOWN shares 大致均衡
+    # ── 入场限制 (v2.0) ──
+    max_entries_per_window: 25      # 每窗口最大入场次数, 数据显示 16-30 最优
+
+    # ── 震荡过滤 (v2.1) ──
+    max_ptb_crosses: 1              # BTC 穿越 PTB 最大次数, 超过则锁定窗口
+                                    # crosses=0: 86% WR +$85 / crosses<=1: 70% WR +$75
+    max_window_cost: 50.0           # 单窗口最大总投入 ($), 防止单窗口风险敞口过大
+
+    # ── Gap 平衡 (v2.0 已弃用, 保留兼容) ──
+    gap_weight_factor: 0.0          # v2.0 不再做 gap 平衡, 设为 0
 
     # ── 流动性 ──
     min_depth: 50.0                 # 对手盘最低深度 (USDC)
@@ -55,6 +65,9 @@ strategy:
 
     # ── 手续费 ──
     fee_rate: 0.002                 # Taker 手续费 0.2%
+
+    # ── 窗口止损 ──
+    window_stop_loss: 15.0          # 窗口最大亏损上限 ($), mark-to-market
 
   # ── 运行参数 ──
   market_id: ""                     # 运行时自动发现

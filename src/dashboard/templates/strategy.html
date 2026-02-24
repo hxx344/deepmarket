@@ -16,10 +16,10 @@
   <div class="card">
     <div class="flex items-center justify-between mb-4">
       <div class="flex items-center gap-3">
-        <h3 class="text-sm font-semibold text-gray-300">BN-RTDS Spread Lead-Lag</h3>
-        <span class="badge badge-blue text-[10px]">v<span x-text="stratVersion">1.0</span></span>
+        <h3 class="text-sm font-semibold text-gray-300">BN-RTDS Direction Conviction</h3>
+        <span class="badge badge-blue text-[10px]">v<span x-text="stratVersion">2.0</span></span>
         <span class="badge text-[10px]"
-              :class="{'badge-green': signalState === 'DIVERGED_UP', 'badge-red': signalState === 'DIVERGED_DOWN', 'badge-yellow': signalState === 'IDLE'}"
+              :class="{'badge-green': signalState === 'COMMITTED_UP', 'badge-red': signalState === 'COMMITTED_DOWN', 'badge-yellow': signalState === 'IDLE'}"
               x-text="signalState">IDLE</span>
       </div>
       <div class="flex items-center gap-3 text-xs">
@@ -234,11 +234,11 @@
           <p class="stat-value !text-xl text-white font-mono" x-text="formatCountdown(pmSecondsLeft)">0:00</p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
-          <p class="stat-label">Diverge 交易</p>
+          <p class="stat-label">Conviction 交易</p>
           <p class="stat-value text-yellow-400 !text-xl" x-text="divergeTrades">0</p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
-          <p class="stat-label">Revert 交易</p>
+          <p class="stat-label">Hedge/Flip 交易</p>
           <p class="stat-value text-cyan-400 !text-xl" x-text="revertTrades">0</p>
         </div>
       </div>
@@ -252,13 +252,13 @@
           </div>
           <svg class="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
           <div class="flex-1 text-center rounded-lg py-2 text-xs font-bold transition-all"
-               :class="signalState === 'DIVERGED_UP' ? 'bg-green-500/30 text-green-300 ring-1 ring-green-500/50' : 'bg-surface-3 text-gray-500'">
-            DIVERGED_UP
+               :class="signalState === 'COMMITTED_UP' ? 'bg-green-500/30 text-green-300 ring-1 ring-green-500/50' : 'bg-surface-3 text-gray-500'">
+            COMMITTED_UP
           </div>
           <svg class="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
           <div class="flex-1 text-center rounded-lg py-2 text-xs font-bold transition-all"
-               :class="signalState === 'DIVERGED_DOWN' ? 'bg-red-500/30 text-red-300 ring-1 ring-red-500/50' : 'bg-surface-3 text-gray-500'">
-            DIVERGED_DOWN
+               :class="signalState === 'COMMITTED_DOWN' ? 'bg-red-500/30 text-red-300 ring-1 ring-red-500/50' : 'bg-surface-3 text-gray-500'">
+            COMMITTED_DOWN
           </div>
         </div>
       </div>

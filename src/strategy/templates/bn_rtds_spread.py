@@ -1,27 +1,32 @@
 """
-BN-RTDS Spread Lead-Lag Strategy v1.0
+BN-RTDS Direction Conviction Strategy v2.1
 
 核心思路:
-    Binance BTC/USDT 是全球流动性最深的 BTC 现货交易所,
-    价格反应速度领先于 Chainlink RTDS (PM 结算源) 约 0.5~3 秒。
-    捕捉 BN-RTDS 差价的快速偏离与回归，产生交易信号：
+    Binance BTC/USDT 价格领先 Chainlink RTDS (PM 结算源) 约 0.5~3 秒。
+    利用 BN-RTDS 价差的 EMA 偏离度判断 5-min 窗口方向,
+    结合 BTC vs PTB (窗口起始价) 双信号确认后, 单边累积持仓。
 
     1) spread = BN_price - RTDS_price
-    2) 计算 spread 的 fast EMA 和 slow EMA (均值)
-    3) deviation = fast_ema - slow_ema
-       - deviation 快速上升 → BN 领先上涨 → RTDS 将跟随 → 买 UP (逢低买入)
-       - deviation 回归零值 → 价差回落 → 买 DOWN (逢高卖出, 平衡持仓)
-       - deviation 快速下降 → BN 领先下跌 → RTDS 将跟随 → 买 DOWN
-       - deviation 回归零值 → 价差回落 → 买 UP (平衡持仓)
+    2) deviation = fast_ema - slow_ema
+    3) 双信号确认:
+       - deviation 方向 + BTC vs PTB 方向一致 → 入场
+       - 仅 deviation 强偏离 (>= strong_deviation) → 也可入场
+    4) 确认后单边累积, 不做强制回归平衡
+       - 方向翻转: 仅在 deviation 反转 + BTC 确认时才翻转
+       - 低价对冲: 对面 ask < cheap_price 时少量买入
 
-    交易方向用 UP/DOWN 的持仓差作为权重:
-       - 目标: 5-min 窗口结束时 UP/DOWN shares 大致均衡
-       - 持仓差越大, 落后方的下单量权重越高
+    v2.0 关键改进 (基于 paper run 数据分析):
+       - 移除 REVERT 回归买入 (数据证明双边均衡无 edge)
+       - 偏向性持仓 86% WR vs 均衡持仓 52% WR
+       - 价格上限过滤 (max_buy_price)
+       - 最大入场次数限制 (16-30 最优区间)
+       - BTC vs PTB 双信号确认提高方向准确率
 
-    按波动剧烈程度分段:
-       - 小偏离: 基础仓位
-       - 中偏离: 1.5x
-       - 大偏离: 2x
+    v2.1 关键改进 (基于 v2.0 paper run 数据分析):
+       - PTB 交叉次数检测: BTC 反复穿越 PTB → 方向不确定 → 停止交易
+         (crosses<=0 的窗口 86% WR $85.57 vs 全部 61.5% WR $19.84)
+       - 窗口最大投入上限 (max_window_cost) 防止单窗口风险敞口过大
+       - 订单 meta 日志增加 signal_type/state 用于离线分析
 
 手续费模型 (Polymarket):
     - Taker fee: 0.2% (按成交 USDC 计)
@@ -46,10 +51,10 @@ from src.trading.executor import ExecutionStatus, OrderRequest, OrderResult, Ord
 
 class BnRtdsSpreadStrategy(Strategy):
     """
-    BN-RTDS Spread Lead-Lag Strategy v1.0
+    BN-RTDS Direction Conviction Strategy v2.1
 
-    利用 Binance (领先) 与 RTDS/Chainlink (滞后) 的价差信号
-    驱动 Polymarket BTC 5-min Up/Down 双边下注。
+    利用 Binance (领先) 与 RTDS/Chainlink (滞后) 的价差偏离度
+    结合 BTC vs PTB 双信号确认 + 震荡过滤, 单边方向累积持仓。
     """
 
     def __init__(
@@ -58,6 +63,9 @@ class BnRtdsSpreadStrategy(Strategy):
         target_shares_per_side: float = 100.0,
         shares_per_order: float = 10.0,
         max_combined_cost: float = 500.0,
+        # ── 价格过滤 (v2.0) ──
+        max_buy_price: float = 0.62,               # 买入价上限 (避免买贵)
+        cheap_price: float = 0.35,                  # 低价对冲阈值
         # ── Spread 计算 ──
         spread_fast_halflife_s: float = 3.0,      # fast EMA 半衰期 (秒)
         spread_slow_halflife_s: float = 30.0,      # slow EMA 半衰期 (均值基准)
@@ -76,6 +84,11 @@ class BnRtdsSpreadStrategy(Strategy):
         # ── 时间窗口 ──
         entry_delay_s: float = 9.0,                # 窗口开始后延迟
         entry_cutoff_s: float = 15.0,              # 窗口结束前停止
+        # ── 入场限制 (v2.0) ──
+        max_entries_per_window: int = 25,           # 每窗口最大入场次数
+        # ── 震荡过滤 (v2.1) ──
+        max_ptb_crosses: int = 1,                   # BTC 穿越 PTB 最大次数, 超过则锁窗口
+        max_window_cost: float = 50.0,              # 单窗口最大总投入 ($)
         # ── Gap 平衡 ──
         gap_weight_factor: float = 0.8,            # 持仓差修正强度
         # ── 流动性 ──
@@ -85,11 +98,17 @@ class BnRtdsSpreadStrategy(Strategy):
         hold_to_settlement: bool = True,
         # ── 手续费 ──
         fee_rate: float = 0.002,
+        # ── 窗口止损 ──
+        window_stop_loss: float = 15.0,          # 窗口最大亏损上限 ($)
     ) -> None:
         # 核心
         self._target_shares_per_side = target_shares_per_side
         self._shares_per_order = shares_per_order
         self._max_combined_cost = max_combined_cost
+
+        # 价格过滤 (v2.0)
+        self._max_buy_price = max_buy_price
+        self._cheap_price = cheap_price
 
         # Spread 计算
         self._spread_fast_halflife = spread_fast_halflife_s
@@ -114,6 +133,13 @@ class BnRtdsSpreadStrategy(Strategy):
         self._entry_delay_s = entry_delay_s
         self._entry_cutoff_s = entry_cutoff_s
 
+        # 入场限制 (v2.0)
+        self._max_entries_per_window = max_entries_per_window
+
+        # 震荡过滤 (v2.1)
+        self._max_ptb_crosses = max_ptb_crosses
+        self._max_window_cost = max_window_cost
+
         # Gap 平衡
         self._gap_weight_factor = gap_weight_factor
 
@@ -127,6 +153,9 @@ class BnRtdsSpreadStrategy(Strategy):
         # 手续费
         self._fee_rate = fee_rate
 
+        # 窗口止损
+        self._window_stop_loss = window_stop_loss
+
         # ── Spread 跟踪 ──
         self._spread_buffer: deque[tuple[float, float]] = deque(
             maxlen=self._spread_buffer_size
@@ -137,9 +166,9 @@ class BnRtdsSpreadStrategy(Strategy):
         self._last_spread_ts: float = 0.0
 
         # ── 信号状态机 ──
-        # IDLE: 等待偏离
-        # DIVERGED_UP: BN 领先上涨, 已买 UP, 等待回归买 DOWN
-        # DIVERGED_DOWN: BN 领先下跌, 已买 DOWN, 等待回归买 UP
+        # IDLE: 等待偏离信号
+        # COMMITTED_UP: 确认看涨方向, 单边累积 UP
+        # COMMITTED_DOWN: 确认看跌方向, 单边累积 DOWN
         self._signal_state: str = "IDLE"
         self._diverge_peak: float = 0.0       # 偏离峰值 (用于分段追踪)
         self._last_stage_level: int = 0       # 上次触发的分段等级
@@ -161,6 +190,9 @@ class BnRtdsSpreadStrategy(Strategy):
         self._last_window_ts: int = 0
         self._entries_this_window: int = 0
         self._window_ptb: float = 0.0
+        self._ptb_crosses: int = 0              # BTC 穿越 PTB 次数
+        self._last_btc_side: str = ""            # 上次 BTC 所在侧
+        self._window_locked: bool = False        # 窗口已锁定 (震荡过多)
 
         # ── 统计 ──
         self._trade_count: int = 0
@@ -194,14 +226,15 @@ class BnRtdsSpreadStrategy(Strategy):
         return "bn_rtds_spread"
 
     def version(self) -> str:
-        return "1.0"
+        return "2.0"
 
     def description(self) -> str:
         return (
-            f"BN-RTDS Spread Lead-Lag v1.0 ("
-            f"target={self._target_shares_per_side}sh/side, "
+            f"BN-RTDS Direction Conviction v2.0 ("
+            f"max_buy={self._max_buy_price}, "
+            f"cheap={self._cheap_price}, "
             f"open_thr=${self._open_threshold}, "
-            f"revert_thr=${self._revert_threshold}, "
+            f"max_entries={self._max_entries_per_window}, "
             f"budget=${self._max_combined_cost})"
         )
 
@@ -210,6 +243,8 @@ class BnRtdsSpreadStrategy(Strategy):
             "target_shares_per_side": self._target_shares_per_side,
             "shares_per_order": self._shares_per_order,
             "max_combined_cost": self._max_combined_cost,
+            "max_buy_price": self._max_buy_price,
+            "cheap_price": self._cheap_price,
             "spread_fast_halflife_s": self._spread_fast_halflife,
             "spread_slow_halflife_s": self._spread_slow_halflife,
             "open_threshold": self._open_threshold,
@@ -220,11 +255,13 @@ class BnRtdsSpreadStrategy(Strategy):
             "signal_cooldown_s": self._signal_cooldown_s,
             "entry_delay_s": self._entry_delay_s,
             "entry_cutoff_s": self._entry_cutoff_s,
+            "max_entries_per_window": self._max_entries_per_window,
             "gap_weight_factor": self._gap_weight_factor,
             "min_depth": self._min_depth,
             "max_spread": self._max_spread,
             "hold_to_settlement": self._hold_to_settlement,
             "fee_rate": self._fee_rate,
+            "window_stop_loss": self._window_stop_loss,
         }
 
     def on_init(self, context: Context) -> None:
@@ -379,6 +416,9 @@ class BnRtdsSpreadStrategy(Strategy):
             self._last_stage_level = 0
             self._diverge_trades_this_window = 0
             self._revert_trades_this_window = 0
+            self._ptb_crosses = 0
+            self._last_btc_side = ""
+            self._window_locked = False
             # 重置 spread EMA (新窗口重新收集)
             self._spread_ema_initialized = False
             logger.info(
@@ -396,22 +436,28 @@ class BnRtdsSpreadStrategy(Strategy):
         now: float,
     ) -> None:
         """
-        Spread 信号状态机驱动交易。
+        Direction Conviction 信号状态机 v2.1
+
+        核心理念:
+            基于 EMA deviation 判断方向，结合 BTC vs PTB 确认，
+            单边累积持仓。不做强制回归平衡。
+
+        v2.1 新增:
+          - PTB 交叉检测: BTC 反复穿越 PTB → 震荡锁定
+          - 窗口最大投入: 限制单窗口风险敞口
 
         状态转移:
           IDLE
-            → deviation > open_threshold  → 买 UP  → DIVERGED_UP
-            → deviation < -open_threshold → 买 DOWN → DIVERGED_DOWN
+            → |dev| >= open_threshold + 双信号确认 → COMMITTED_UP/DOWN
+            → |dev| >= strong_deviation (无需确认) → COMMITTED_UP/DOWN
 
-          DIVERGED_UP
-            → deviation 继续扩大 → 分段追加买 UP
-            → |deviation| < revert_threshold → 买 DOWN → IDLE
-            → deviation < -open_threshold → 反向切换 → 买 DOWN → DIVERGED_DOWN
+          COMMITTED_UP
+            → dev 继续上升且跨越新 stage → 追加买 UP
+            → dev < -open_threshold AND btc < ptb → 翻转 → COMMITTED_DOWN
+            → |dev| < revert_threshold → 回归 IDLE (不买 DOWN)
+            → DOWN ask < cheap_price → 少量对冲
 
-          DIVERGED_DOWN
-            → deviation 继续扩大 → 分段追加买 DOWN
-            → |deviation| < revert_threshold → 买 UP → IDLE
-            → deviation > open_threshold → 反向切换 → 买 UP → DIVERGED_UP
+          COMMITTED_DOWN (镜像)
         """
         secs_left = ctx.market.pm_window_seconds_left
         if secs_left <= 0:
@@ -428,13 +474,11 @@ class BnRtdsSpreadStrategy(Strategy):
         if secs_left < self._entry_cutoff_s:
             return
 
-        # EMA 尚未稳定 (至少需要一个 slow halflife 的数据)
+        # EMA 尚未稳定
         if not self._spread_ema_initialized:
             return
         if len(self._spread_buffer) < 5:
             return
-
-        # 注: target_shares_per_side 仅作为进度参考, 不限制交易
 
         # 预算耗尽
         total_invested = self._cum_up_cost + self._cum_dn_cost
@@ -442,176 +486,278 @@ class BnRtdsSpreadStrategy(Strategy):
         if remaining_budget < 2.0:
             return
 
-        # 交易后冷却 (已取消)
-        # if self._last_trade_time > 0:
-        #     since_trade = now - self._last_trade_time
-        #     if since_trade < self._post_trade_pause_s:
-        #         return
+        # 窗口止损: 双边合计 mark-to-market
+        if self._window_stop_loss > 0 and total_invested > 0:
+            up_price = self._get_ask_price(ctx, "UP")
+            dn_price = self._get_ask_price(ctx, "DOWN")
+            up_value = self._cum_up_shares * up_price
+            dn_value = self._cum_dn_shares * dn_price
+            unrealized_pnl = (up_value + dn_value) - total_invested
+            if unrealized_pnl < -self._window_stop_loss:
+                if self._entries_this_window > 0:
+                    logger.warning(
+                        f"[{self.name()}] ⛔ 窗口止损触发 | "
+                        f"unrealized={unrealized_pnl:+.2f} < "
+                        f"-${self._window_stop_loss:.0f} | 停止交易"
+                    )
+                return
+
+        # 最大入场次数限制 (v2.0)
+        if self._entries_this_window >= self._max_entries_per_window:
+            return
+
+        # 窗口锁定: 震荡过多已停止交易 (v2.1)
+        if self._window_locked:
+            return
+
+        # 窗口最大投入限制 (v2.1)
+        if self._max_window_cost > 0 and total_invested >= self._max_window_cost:
+            return
 
         dev = self._deviation
         abs_dev = abs(dev)
 
+        # BTC vs PTB 方向信号
+        btc = ctx.market.btc_price
+        btc_vs_ptb = btc - self._window_ptb if self._window_ptb > 0 else 0
+        btc_side = "UP" if btc_vs_ptb > 0 else "DOWN"
+
+        # ── PTB 交叉检测 (v2.1) ──
+        if self._last_btc_side and btc_side != self._last_btc_side:
+            self._ptb_crosses += 1
+            if self._ptb_crosses > self._max_ptb_crosses:
+                logger.info(
+                    f"[{self.name()}] ⛔ 震荡锁定 | "
+                    f"PTB交叉={self._ptb_crosses}次 > {self._max_ptb_crosses} | "
+                    f"停止本窗口交易 | "
+                    f"已有 UP={self._cum_up_shares:.0f} DN={self._cum_dn_shares:.0f}"
+                )
+                self._window_locked = True
+                self._signal_state = "IDLE"
+                return
+        self._last_btc_side = btc_side
+
         # ── 状态机 ──
 
         if self._signal_state == "IDLE":
-            # 等待偏离信号
+            # 等待偏离信号 + BTC vs PTB 方向确认
             if abs_dev >= self._open_threshold:
-                if dev > 0:
-                    # BN 领先上涨 → 买 UP (逢低买入: RTDS 还没跟上)
-                    direction = "UP"
-                    self._signal_state = "DIVERGED_UP"
-                    self._diverge_peak = dev
-                    self._last_stage_level = 0
+                dev_side = "UP" if dev > 0 else "DOWN"
+
+                # 必须: BTC 价格方向和 deviation 方向一致
+                signals_agree = (dev_side == btc_side)
+
+                if not signals_agree:
+                    # 方向不一致 → 不入场
+                    # 但如果反面信号很强 (BTC 方向 + 极端偏离), 跟 BTC 方向
+                    if abs_dev >= self._extreme_deviation:
+                        direction = btc_side  # 信任 BTC vs PTB 方向
+                        logger.info(
+                            f"[{self.name()}] 📊 极端矛盾 → 跟 BTC 方向 | "
+                            f"dev={dev:+.2f}→{dev_side} BUT btc_vs_ptb={btc_vs_ptb:+.1f}→{btc_side}"
+                        )
+                    else:
+                        return
                 else:
-                    # BN 领先下跌 → 买 DOWN
-                    direction = "DOWN"
-                    self._signal_state = "DIVERGED_DOWN"
+                    direction = dev_side
+
+                    # 价格上限检查 (v2.0)
+                    ask = self._get_ask_price(ctx, direction)
+                    if ask > self._max_buy_price:
+                        logger.debug(
+                            f"[{self.name()}] 价格过高 {direction} "
+                            f"ask={ask:.3f} > {self._max_buy_price:.3f}"
+                        )
+                        return
+
+                    self._signal_state = f"COMMITTED_{direction}"
                     self._diverge_peak = dev
                     self._last_stage_level = 0
 
-                stage_mult = self._get_stage_multiplier(abs_dev)
-                order_shares = self._calc_order_shares(
-                    direction, stage_mult, secs_left, remaining_budget
-                )
-
-                if order_shares >= 0.1:
-                    logger.info(
-                        f"[{self.name()}] 📊 偏离信号 | "
-                        f"dev={dev:+.2f} → {direction} | "
-                        f"stage_mult={stage_mult:.1f} "
-                        f"shares={order_shares:.1f} | "
-                        f"state→{self._signal_state}"
-                    )
-                    await self._execute_trade(
-                        ctx, direction, order_shares, dev, secs_left,
-                        remaining_budget, "DIVERGE"
-                    )
-
-        elif self._signal_state == "DIVERGED_UP":
-            # BN 领先上涨中...
-            if abs_dev < self._revert_threshold:
-                # 回归均值 → 买 DOWN (逢高卖出/平衡持仓)
-                stage_mult = 1.0
-                order_shares = self._calc_order_shares(
-                    "DOWN", stage_mult, secs_left, remaining_budget
-                )
-                if order_shares >= 0.1:
-                    logger.info(
-                        f"[{self.name()}] 🔄 回归信号 | "
-                        f"dev={dev:+.2f} → DOWN (回归) | "
-                        f"shares={order_shares:.1f} | state→IDLE"
-                    )
-                    await self._execute_trade(
-                        ctx, "DOWN", order_shares, dev, secs_left,
-                        remaining_budget, "REVERT"
-                    )
-                self._signal_state = "IDLE"
-                self._diverge_peak = 0.0
-                self._last_stage_level = 0
-
-            elif dev < -self._open_threshold:
-                # 反向切换: 从 UP 偏离直接转为 DOWN 偏离
-                stage_mult = self._get_stage_multiplier(abs_dev)
-                order_shares = self._calc_order_shares(
-                    "DOWN", stage_mult, secs_left, remaining_budget
-                )
-                if order_shares >= 0.1:
-                    logger.info(
-                        f"[{self.name()}] ⚡ 反向切换 | "
-                        f"dev={dev:+.2f} DIVERGED_UP→DIVERGED_DOWN | "
-                        f"mult={stage_mult:.1f} shares={order_shares:.1f}"
-                    )
-                    await self._execute_trade(
-                        ctx, "DOWN", order_shares, dev, secs_left,
-                        remaining_budget, "REVERSE"
-                    )
-                self._signal_state = "DIVERGED_DOWN"
-                self._diverge_peak = dev
-                self._last_stage_level = self._get_current_stage(abs_dev)
-
-            elif dev > self._diverge_peak:
-                # 偏离继续扩大 → 检查是否跨越新分段
-                new_stage = self._get_current_stage(abs_dev)
-                if new_stage > self._last_stage_level:
                     stage_mult = self._get_stage_multiplier(abs_dev)
                     order_shares = self._calc_order_shares(
-                        "UP", stage_mult, secs_left, remaining_budget
+                        direction, stage_mult, secs_left, remaining_budget
                     )
+
                     if order_shares >= 0.1:
+                        reason = "双信号确认" if signals_agree else "强偏离"
                         logger.info(
-                            f"[{self.name()}] 📈 追加偏离 | "
-                            f"dev={dev:+.2f} → UP (stage {new_stage}) | "
-                            f"mult={stage_mult:.1f} shares={order_shares:.1f}"
+                            f"[{self.name()}] 📊 {reason}入场 | "
+                            f"dev={dev:+.2f} btc_vs_ptb={btc_vs_ptb:+.1f} "
+                            f"→ {direction} | "
+                            f"shares={order_shares:.1f} | "
+                            f"state→{self._signal_state}"
                         )
                         await self._execute_trade(
-                            ctx, "UP", order_shares, dev, secs_left,
-                            remaining_budget, "DIVERGE_ADD"
+                            ctx, direction, order_shares, dev, secs_left,
+                            remaining_budget, "CONVICTION"
                         )
-                    self._last_stage_level = new_stage
-                self._diverge_peak = dev
 
-        elif self._signal_state == "DIVERGED_DOWN":
-            # BN 领先下跌中...
-            if abs_dev < self._revert_threshold:
-                # 回归均值 → 买 UP (平衡持仓)
-                stage_mult = 1.0
-                order_shares = self._calc_order_shares(
-                    "UP", stage_mult, secs_left, remaining_budget
-                )
-                if order_shares >= 0.1:
-                    logger.info(
-                        f"[{self.name()}] 🔄 回归信号 | "
-                        f"dev={dev:+.2f} → UP (回归) | "
-                        f"shares={order_shares:.1f} | state→IDLE"
-                    )
-                    await self._execute_trade(
-                        ctx, "UP", order_shares, dev, secs_left,
-                        remaining_budget, "REVERT"
-                    )
-                self._signal_state = "IDLE"
-                self._diverge_peak = 0.0
-                self._last_stage_level = 0
+        elif self._signal_state == "COMMITTED_UP":
+            # ── 已确认看涨方向 ──
 
-            elif dev > self._open_threshold:
-                # 反向切换: 从 DOWN 偏离直接转为 UP 偏离
-                stage_mult = self._get_stage_multiplier(abs_dev)
-                order_shares = self._calc_order_shares(
-                    "UP", stage_mult, secs_left, remaining_budget
-                )
-                if order_shares >= 0.1:
-                    logger.info(
-                        f"[{self.name()}] ⚡ 反向切换 | "
-                        f"dev={dev:+.2f} DIVERGED_DOWN→DIVERGED_UP | "
-                        f"mult={stage_mult:.1f} shares={order_shares:.1f}"
-                    )
-                    await self._execute_trade(
-                        ctx, "UP", order_shares, dev, secs_left,
-                        remaining_budget, "REVERSE"
-                    )
-                self._signal_state = "DIVERGED_UP"
-                self._diverge_peak = dev
-                self._last_stage_level = self._get_current_stage(abs_dev)
-
-            elif dev < self._diverge_peak:
-                # 偏离继续扩大 (dev 更负)
-                new_stage = self._get_current_stage(abs_dev)
-                if new_stage > self._last_stage_level:
+            # 1) 强反转 + BTC 确认 → 翻转到 COMMITTED_DOWN
+            if dev < -self._open_threshold and btc_side == "DOWN":
+                ask = self._get_ask_price(ctx, "DOWN")
+                if ask <= self._max_buy_price:
                     stage_mult = self._get_stage_multiplier(abs_dev)
                     order_shares = self._calc_order_shares(
                         "DOWN", stage_mult, secs_left, remaining_budget
                     )
                     if order_shares >= 0.1:
                         logger.info(
-                            f"[{self.name()}] 📉 追加偏离 | "
-                            f"dev={dev:+.2f} → DOWN (stage {new_stage}) | "
-                            f"mult={stage_mult:.1f} shares={order_shares:.1f}"
+                            f"[{self.name()}] ⚡ 方向翻转 UP→DOWN | "
+                            f"dev={dev:+.2f} btc_vs_ptb={btc_vs_ptb:+.1f}"
                         )
                         await self._execute_trade(
                             ctx, "DOWN", order_shares, dev, secs_left,
-                            remaining_budget, "DIVERGE_ADD"
+                            remaining_budget, "FLIP"
                         )
+                self._signal_state = "COMMITTED_DOWN"
+                self._diverge_peak = dev
+                self._last_stage_level = self._get_current_stage(abs_dev)
+                return
+
+            # 2) 回归均值 → IDLE (不买 DOWN — v2.0 核心改动)
+            if abs_dev < self._revert_threshold:
+                logger.debug(
+                    f"[{self.name()}] 回归 IDLE | dev={dev:+.2f}"
+                )
+                self._signal_state = "IDLE"
+                self._diverge_peak = 0.0
+                self._last_stage_level = 0
+                return
+
+            # 2.5) BTC 已跌破 PTB → 方向已变, 回 IDLE (v2.0 关键保护)
+            if btc_side == "DOWN":
+                logger.info(
+                    f"[{self.name()}] ⚠️ BTC<PTB 中止 UP | "
+                    f"btc_vs_ptb={btc_vs_ptb:+.1f} → IDLE"
+                )
+                self._signal_state = "IDLE"
+                self._diverge_peak = 0.0
+                self._last_stage_level = 0
+                return
+
+            # 3) 偏离继续扩大 → 追加 UP (BTC>PTB 已确认)
+            if dev > self._diverge_peak:
+                new_stage = self._get_current_stage(abs_dev)
+                if new_stage > self._last_stage_level:
+                    ask = self._get_ask_price(ctx, "UP")
+                    if ask <= self._max_buy_price:
+                        stage_mult = self._get_stage_multiplier(abs_dev)
+                        order_shares = self._calc_order_shares(
+                            "UP", stage_mult, secs_left, remaining_budget
+                        )
+                        if order_shares >= 0.1:
+                            logger.info(
+                                f"[{self.name()}] 📈 追加 UP | "
+                                f"dev={dev:+.2f} stage={new_stage}"
+                            )
+                            await self._execute_trade(
+                                ctx, "UP", order_shares, dev, secs_left,
+                                remaining_budget, "ACCUMULATE"
+                            )
                     self._last_stage_level = new_stage
                 self._diverge_peak = dev
+
+            # 4) 低价对冲: DOWN 极便宜时少量买入 (v2.0)
+            dn_ask = self._get_ask_price(ctx, "DOWN")
+            if (dn_ask <= self._cheap_price
+                    and self._cum_dn_shares < self._cum_up_shares * 0.3
+                    and remaining_budget > self._shares_per_order * dn_ask):
+                hedge_shares = self._shares_per_order * 0.5
+                if hedge_shares >= 0.1:
+                    logger.info(
+                        f"[{self.name()}] 🛡️ 低价对冲 DN@{dn_ask:.3f}"
+                    )
+                    await self._execute_trade(
+                        ctx, "DOWN", hedge_shares, dev, secs_left,
+                        remaining_budget, "HEDGE"
+                    )
+
+        elif self._signal_state == "COMMITTED_DOWN":
+            # ── 已确认看跌方向 ──
+
+            # 1) 强反转 + BTC 确认 → 翻转到 COMMITTED_UP
+            if dev > self._open_threshold and btc_side == "UP":
+                ask = self._get_ask_price(ctx, "UP")
+                if ask <= self._max_buy_price:
+                    stage_mult = self._get_stage_multiplier(abs_dev)
+                    order_shares = self._calc_order_shares(
+                        "UP", stage_mult, secs_left, remaining_budget
+                    )
+                    if order_shares >= 0.1:
+                        logger.info(
+                            f"[{self.name()}] ⚡ 方向翻转 DOWN→UP | "
+                            f"dev={dev:+.2f} btc_vs_ptb={btc_vs_ptb:+.1f}"
+                        )
+                        await self._execute_trade(
+                            ctx, "UP", order_shares, dev, secs_left,
+                            remaining_budget, "FLIP"
+                        )
+                self._signal_state = "COMMITTED_UP"
+                self._diverge_peak = dev
+                self._last_stage_level = self._get_current_stage(abs_dev)
+                return
+
+            # 2) 回归均值 → IDLE (不买 UP — v2.0 核心改动)
+            if abs_dev < self._revert_threshold:
+                logger.debug(
+                    f"[{self.name()}] 回归 IDLE | dev={dev:+.2f}"
+                )
+                self._signal_state = "IDLE"
+                self._diverge_peak = 0.0
+                self._last_stage_level = 0
+                return
+
+            # 2.5) BTC 已涨破 PTB → 方向已变, 回 IDLE (v2.0 关键保护)
+            if btc_side == "UP":
+                logger.info(
+                    f"[{self.name()}] ⚠️ BTC>PTB 中止 DOWN | "
+                    f"btc_vs_ptb={btc_vs_ptb:+.1f} → IDLE"
+                )
+                self._signal_state = "IDLE"
+                self._diverge_peak = 0.0
+                self._last_stage_level = 0
+                return
+
+            # 3) 偏离继续扩大 → 追加 DOWN (BTC<PTB 已确认)
+            if dev < self._diverge_peak:
+                new_stage = self._get_current_stage(abs_dev)
+                if new_stage > self._last_stage_level:
+                    ask = self._get_ask_price(ctx, "DOWN")
+                    if ask <= self._max_buy_price:
+                        stage_mult = self._get_stage_multiplier(abs_dev)
+                        order_shares = self._calc_order_shares(
+                            "DOWN", stage_mult, secs_left, remaining_budget
+                        )
+                        if order_shares >= 0.1:
+                            logger.info(
+                                f"[{self.name()}] 📉 追加 DOWN | "
+                                f"dev={dev:+.2f} stage={new_stage}"
+                            )
+                            await self._execute_trade(
+                                ctx, "DOWN", order_shares, dev, secs_left,
+                                remaining_budget, "ACCUMULATE"
+                            )
+                    self._last_stage_level = new_stage
+                self._diverge_peak = dev
+
+            # 4) 低价对冲: UP 极便宜时少量买入 (v2.0)
+            up_ask = self._get_ask_price(ctx, "UP")
+            if (up_ask <= self._cheap_price
+                    and self._cum_up_shares < self._cum_dn_shares * 0.3
+                    and remaining_budget > self._shares_per_order * up_ask):
+                hedge_shares = self._shares_per_order * 0.5
+                if hedge_shares >= 0.1:
+                    logger.info(
+                        f"[{self.name()}] 🛡️ 低价对冲 UP@{up_ask:.3f}"
+                    )
+                    await self._execute_trade(
+                        ctx, "UP", hedge_shares, dev, secs_left,
+                        remaining_budget, "HEDGE"
+                    )
 
     # ================================================================
     #  分段逻辑
@@ -651,7 +797,7 @@ class BnRtdsSpreadStrategy(Strategy):
         return self._stage_multipliers[idx]
 
     # ================================================================
-    #  下单量计算 (含 gap 平衡权重)
+    #  下单量计算 (v2.0 conviction-based)
     # ================================================================
 
     def _calc_order_shares(
@@ -662,39 +808,18 @@ class BnRtdsSpreadStrategy(Strategy):
         remaining_budget: float,
     ) -> float:
         """
-        计算下单 shares 数, 考虑:
+        计算下单 shares 数 (v2.0):
             1. 基础量 × 分段倍率
-            2. Gap 权重: 落后方加量, 领先方减量
-            3. 窗口尾部缩量
-            4. 剩余预算限制
+            2. 窗口尾部缩量
+            3. 剩余预算限制
+
+        v2.0: 移除 gap 平衡调整, 方向由信号决定。
         """
         base = self._shares_per_order * stage_multiplier
 
-        # ── Gap 权重 ──
-        gap = self._cum_up_shares - self._cum_dn_shares
-        total = max(self._cum_up_shares, self._cum_dn_shares, 1.0)
-        gap_ratio = gap / total  # 正=UP多, 负=DN多
-
-        if direction == "UP":
-            if gap_ratio > 0:
-                # UP 已多, 买 UP 减量
-                base *= max(0.3, 1.0 - abs(gap_ratio) * self._gap_weight_factor)
-            else:
-                # DN 多, 买 UP 加量 (补差)
-                base *= min(2.0, 1.0 + abs(gap_ratio) * self._gap_weight_factor)
-        else:  # DOWN
-            if gap_ratio < 0:
-                # DN 已多, 买 DN 减量
-                base *= max(0.3, 1.0 - abs(gap_ratio) * self._gap_weight_factor)
-            else:
-                # UP 多, 买 DN 加量 (补差)
-                base *= min(2.0, 1.0 + abs(gap_ratio) * self._gap_weight_factor)
-
-        # ── 窗口尾部缩量 (精细平衡) ──
+        # ── 窗口尾部缩量 ──
         if secs_left < 45:
             base = min(base, max(1.0, self._shares_per_order * 0.3))
-
-        # 注: 不设 shares 上限, 仅受 max_combined_cost 预算约束
 
         return max(0, base)
 
@@ -775,6 +900,9 @@ class BnRtdsSpreadStrategy(Strategy):
             f"edge={edge:+.4f}"
         )
 
+        # 记录信号类型, 供 _submit_order 写入 meta.extra
+        self._last_signal_type = signal_type
+
         result = await self._submit_order(ctx, order_side, ask, cost)
 
         if result and result.status == ExecutionStatus.FILLED:
@@ -805,7 +933,7 @@ class BnRtdsSpreadStrategy(Strategy):
             self._entries_this_window += 1
             self._last_trade_time = now
 
-            if signal_type.startswith("DIVERGE"):
+            if signal_type in ("CONVICTION", "ACCUMULATE", "DIVERGE", "DIVERGE_ADD"):
                 self._diverge_trades_this_window += 1
             else:
                 self._revert_trades_this_window += 1
@@ -1176,6 +1304,13 @@ class BnRtdsSpreadStrategy(Strategy):
                 "cum_dn_cost": round(self._cum_dn_cost, 4),
                 "entry_num": self._entries_this_window,
                 "burst_num": getattr(self, '_burst_count_this_window', 0),
+                # ── 用于 DB meta 字段 (v2.1) ──
+                "extra": {
+                    "signal_type": getattr(self, '_last_signal_type', ''),
+                    "state": self._signal_state,
+                    "ptb_crosses": self._ptb_crosses,
+                    "btc_side": "UP" if (ctx.market.btc_price - self._window_ptb) > 0 else "DOWN",
+                },
             },
         )
         return await executor.submit_order(request)
@@ -1277,6 +1412,8 @@ class BnRtdsSpreadStrategy(Strategy):
             "entries_this_window": self._entries_this_window,
             "diverge_trades": self._diverge_trades_this_window,
             "revert_trades": self._revert_trades_this_window,
+            "ptb_crosses": self._ptb_crosses,
+            "window_locked": self._window_locked,
             "up_progress_pct": round(
                 self._cum_up_shares / self._target_shares_per_side * 100, 1
             ),
