@@ -1654,16 +1654,18 @@ def _do_settle(settle_price: float, ptb: float, src: str = "RTDS"):
         })
         if len(state.settled_windows) > 500:
             state.settled_windows = state.settled_windows[-500:]
+        _q = ps.get('question', '') or ps.get('slug', '')
         print(
             f"[结算] {won} 赢 | PnL=${pnl:.2f} | "
             f"结算价=${settle_price:,.2f} vs PTB=${ptb:,.2f} | "
-            f"来源={src}"
+            f"来源={src} | {_q}"
         )
         _db_save_settlement(state.settled_windows[-1])
     else:
+        _q = ps.get('question', '') or ps.get('slug', '')
         print(
             f"[结算] 无交易 (cost=0), 跳过 | "
-            f"结算价=${settle_price:,.2f} vs PTB=${ptb:,.2f}"
+            f"结算价=${settle_price:,.2f} vs PTB=${ptb:,.2f} | {_q}"
         )
     state._pending_settle = None
 
