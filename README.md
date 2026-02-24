@@ -123,6 +123,41 @@ python monitor_0x1d.py --port 9999
 
 **面板功能：**
 
+### 5. RTDS 连通性 & 稳定性测试
+
+独立的网络诊断工具，检测 VPS/本地机器与 Polymarket RTDS (Chainlink BTC/USD) 之间的连接质量。**零项目依赖**，只需 `aiohttp`，可直接拷贝到任何机器运行。
+
+```bash
+# 默认测试 5 分钟
+python test_rtds_stability.py
+
+# 指定时长 (秒)
+python test_rtds_stability.py --duration 60
+
+# 无限运行 (Ctrl+C 停止)
+python test_rtds_stability.py --duration 0
+```
+
+**测试项目：**
+
+| 阶段 | 测试内容 | 说明 |
+|------|----------|------|
+| Phase 1 | TCP + TLS 握手 | 含 429 限流自动重试 (指数退避) |
+| Phase 2 | WebSocket 订阅 | 发送 `crypto_prices_chainlink` 订阅请求 |
+| Phase 3 | 首条数据到达 | 等待 subscribe 确认 + 首条 BTC/USD |
+| Phase 4 | 持续监测 | 数据频率、价格跳动、Ping-Pong RTT、PTB 边界事件 |
+
+**报告内容：**
+- **连接延迟**：TCP+TLS、订阅确认、首条BTC到达时间
+- **数据流**：BTC/USD 消息频率、间隔统计 (avg/med/max)、大间隔告警
+- **BTC 价格**：实时价格范围、价格跳动幅度
+- **数据新鲜度**：`receive_time - observationTimestamp`，衡量 Chainlink 源延迟
+- **Ping-Pong RTT**：WebSocket 往返延迟、丢包率
+- **PTB 边界事件**：5-min 整点 (obs_ts % 300 == 0) 的捕获与接收延迟
+- **综合评估**：基于以上指标自动判断是否适合生产使用
+
+> 💡 遇到 429 限流时会自动等待重试（最多 5 次，每次间隔递增 10s）。频繁重连后建议等待 30-60s 再测试。
+
 | 模块 | 说明 |
 |------|------|
 | **BTC 行情** | Binance WebSocket 实时 BTC/USDT 价格 + 5s 动量 |
