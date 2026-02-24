@@ -1707,28 +1707,44 @@ def _get_settle_price(end_ts: int) -> tuple[float, str]:
 
 
 SETTLE_RTDS_WAIT = 5  # 等待 RTDS 0秒价格的秒数
+SETTLE_LATE_GRACE = 10  # 结算宽限期 (秒): 等待 Activity API 迟到交易追补
 
 
 def _settle_pending():
     """创建 _pending_settle 后:
-    1. RTDS 边界缓存已有 → 立即用 RTDS 价格结算
-    2. 否则延迟 5s 等 RTDS inline 结算, 超时再用 Buffer 回溯
+    始终等待宽限期 (SETTLE_LATE_GRACE), 让 Activity API 迟到交易追补到 _pending_settle。
+    宽限期内同步等待 RTDS 结算价到达; 超时则用 Buffer 回溯。
     """
     ps = state._pending_settle
     if not ps:
         return
-    # 先检查 RTDS 边界缓存是否已精确匹配
+
+    # 先尝试获取结算价 (可能已有 RTDS 边界缓存)
     settle_price, src = _get_settle_price(ps["end_ts"])
+
     if src == "RTDS" and settle_price > 0:
-        # RTDS 已缓存, 立即结算
-        _do_settle(settle_price, ps["ptb"] or 0.0, src)
+        # RTDS 已有, 但仍需等宽限期让迟到交易追补
+        print(f"[结算] RTDS价格就绪, 等待迟到交易追补 ({SETTLE_LATE_GRACE}s)...")
+
+        async def _grace_settle():
+            await asyncio.sleep(SETTLE_LATE_GRACE)
+            if not state._pending_settle:
+                return  # 已被其他路径结算
+            ps2 = state._pending_settle
+            _do_settle(settle_price, ps2["ptb"] or 0.0, src)
+
+        try:
+            asyncio.get_event_loop().create_task(_grace_settle())
+        except RuntimeError:
+            _do_settle(settle_price, ps["ptb"] or 0.0, src)
         return
 
     # RTDS 尚未到达, 延迟等待 — RTDS inline handler 可能在这期间结算
-    print(f"[结算] 等待RTDS精确价格 ({SETTLE_RTDS_WAIT}s)...")
+    total_wait = max(SETTLE_RTDS_WAIT, SETTLE_LATE_GRACE)
+    print(f"[结算] 等待RTDS精确价格+迟到交易 ({total_wait}s)...")
 
     async def _delayed_settle():
-        await asyncio.sleep(SETTLE_RTDS_WAIT)
+        await asyncio.sleep(total_wait)
         if not state._pending_settle:
             return  # 已被 RTDS inline 结算
         ps2 = state._pending_settle
@@ -2217,8 +2233,7 @@ async def poll_0x1d_activity():
                                         state.reset_window()
                                         print(f"[Activity] 新窗口就绪 (PTB=${ptb:,.2f}), 继续处理交易...")
                                     else:
-                                        # 更老的窗口, 无法追补 → 跳过
-                                        print(f"[Activity] ⚠ 跳过过期BTC交易: {slug[-15:]} (当前={state.window_slug[-15:]})")
+                                        # 更老的窗口, 无法追补 → 静默跳过
                                         continue
                                 except (ValueError, TypeError):
                                     print(f"[Activity] ⚠ 无法解析BTC slug: {slug}")
