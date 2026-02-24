@@ -1709,7 +1709,7 @@ def _get_settle_price(end_ts: int) -> tuple[float, str]:
     return 0.0, "无"
 
 
-SETTLE_LATE_GRACE = 12  # 结算宽限期 (秒): 等待 RTDS 边界价到达 + Activity API 迟到交易追补
+SETTLE_LATE_GRACE = 20  # 结算宽限期 (秒): 等待 RTDS 边界价到达 + Activity API 迟到交易追补
 
 
 def _settle_pending():
