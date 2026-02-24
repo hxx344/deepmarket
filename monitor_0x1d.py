@@ -2160,8 +2160,6 @@ async def poll_0x1d_activity():
                             # ── 非 BTC 5-min 交易: 静默跳过 ──
                             if not is_btc_5m:
                                 _dropped_non_btc += 1
-                                if _dropped_non_btc % 50 == 1:
-                                    print(f"[Activity] 跳过非BTC交易 (累计{_dropped_non_btc}) slug={slug[:40]}")
                                 continue
 
                             # ── BTC 5-min 交易, 但 slug 不匹配当前窗口 ──
@@ -2258,9 +2256,7 @@ async def poll_0x1d_activity():
                                 "usdc": round(usdc, 2),
                                 "slug": slug,
                             }
-                            if ts_clob:
-                                latency = ts_int - ts_clob
-                                print(f"[CLOB] 入场时间修正: {side} 链下→上链 延迟={latency:.1f}s")
+                            # (CLOB 时间戳修正统计由定时摘要打印)
 
                             state.trades_0x1d.append(trade_rec)
                             state.trade_count_window += 1
@@ -2594,8 +2590,7 @@ async def poll_0x1d_activity():
                                 tx, ts_int, slug, side, shares,
                                 price, usdc, state.trade_momentum_snaps[-1]
                             )
-                            if _feature_latency > 2.0:
-                                print(f"[Feature] ⚠ 特征回溯 {_feature_latency:.1f}s ({pm_snap.get('ts', 0) > 0 and 'PM有历史' or 'PM用当前'})")
+                            # (特征回溯延迟统计由定时摘要打印)
 
                           except Exception as _trade_err:
                             # 单笔交易处理失败 → 跳过本笔, 不影响后续交易
@@ -2619,6 +2614,55 @@ async def poll_0x1d_activity():
                 state.activity_connected = False
 
             await asyncio.sleep(POLL_ACTIVITY_INTERVAL)
+
+
+# ─────────────────────────────────────────────────────────
+#  定时状态摘要
+# ─────────────────────────────────────────────────────────
+
+SUMMARY_INTERVAL = 60  # 每 60 秒打印一次摘要
+
+async def periodic_summary():
+    """定期打印数据收集摘要 + 连接状态"""
+    await asyncio.sleep(10)  # 启动后等 10s, 让各连接建立
+    while True:
+        now = time.time()
+        # ── 连接状态 ──
+        conn_flags = []
+        conn_flags.append(f"RTDS={'✓' if state.rtds_connected else '✗'}")
+        conn_flags.append(f"Binance={'✓' if state.binance_connected else '✗'}")
+        conn_flags.append(f"PM={'✓' if state.pm_connected else '✗'}")
+        conn_flags.append(f"CLOB_WS={'✓' if state.clob_ws_connected else '✗'}")
+        conn_flags.append(f"Activity={'✓' if state.activity_connected else '✗'}")
+        conn_str = " | ".join(conn_flags)
+
+        # ── 数据量 ──
+        btc_n = len(state.btc_history)
+        bn_n = len(state.bn_history)
+        pm_n = len(state.pm_price_history)
+        trades_n = len(state.trades_0x1d)
+        clob_n = len(state.clob_trades)
+        settled_n = len(state.settled_windows)
+        win_trades = state.trade_count_window
+
+        # ── RTDS 健康 ──
+        rtds_uptime = ""
+        if state.rtds_connected and state.rtds_connect_ts > 0:
+            up_s = now - state.rtds_connect_ts
+            rtds_uptime = f", RTDS在线{up_s:.0f}s"
+        rtds_recon = f", 重连{state.rtds_reconnect_count}次" if state.rtds_reconnect_count else ""
+
+        # ── BTC 价格 ──
+        btc_str = f"${state.btc_price:,.2f}" if state.btc_price else "N/A"
+
+        print(
+            f"[摘要] 连接: {conn_str} | "
+            f"BTC={btc_str} | "
+            f"数据: RTDS={btc_n} BN={bn_n} PM={pm_n} 交易={trades_n} CLOB={clob_n} | "
+            f"窗口交易={win_trades} 已结算={settled_n}{rtds_uptime}{rtds_recon}"
+        )
+
+        await asyncio.sleep(SUMMARY_INTERVAL)
 
 
 # ─────────────────────────────────────────────────────────
@@ -2650,7 +2694,6 @@ async def handle_ws(request: aiohttp.web.Request) -> aiohttp.web.WebSocketRespon
     ws = aiohttp.web.WebSocketResponse()
     await ws.prepare(request)
     state.ws_clients.add(ws)
-    print(f"[WS] 客户端连接 (共 {len(state.ws_clients)})")
 
     # 立即推送一次快照
     try:
@@ -2663,7 +2706,6 @@ async def handle_ws(request: aiohttp.web.Request) -> aiohttp.web.WebSocketRespon
             pass  # 前端不发消息, 只接收
     finally:
         state.ws_clients.discard(ws)
-        print(f"[WS] 客户端断开 (共 {len(state.ws_clients)})")
     return ws
 
 
@@ -2725,6 +2767,7 @@ async def start_server(port: int):
         asyncio.create_task(_safe("clob_trade", clob_trade_stream())),
         asyncio.create_task(_safe("poll_activity", poll_0x1d_activity())),
         asyncio.create_task(_safe("ws_push", ws_push_loop())),
+        asyncio.create_task(_safe("summary", periodic_summary())),
     ]
 
     try:
