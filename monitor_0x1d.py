@@ -1551,7 +1551,7 @@ async def chainlink_rtds_stream():
                                     if obs_ts_int % 300 == 0 and obs_ts_int > 0:
                                         old_ptb = state.window_ptb
 
-                                        # ── 保存边界信息 (供窗口切换时即时结算) ──
+                                        # ── 保存边界信息 (供延迟结算使用) ──
                                         # 必须在覆写 window_ptb 之前保存!
                                         state._rtds_boundary = {
                                             "settle_price": price,
@@ -1559,11 +1559,8 @@ async def chainlink_rtds_stream():
                                             "obs_ts": obs_ts_int,
                                             "at": time.time(),
                                         }
-
-                                        # ── 旧窗口即时结算 (如果 _pending_settle 已存在) ──
-                                        if state._pending_settle:
-                                            settle_ptb = state._pending_settle["ptb"] or old_ptb
-                                            _do_settle(price, settle_ptb, "RTDS")
+                                        # 注: 不在此处直接结算, 由 _settle_pending 的延迟任务统一处理
+                                        # 这样可以等待 Activity API 迟到交易追补到 _pending_settle
 
                                         # ── 新窗口 PTB ──
                                         state.window_ptb = price
@@ -1710,61 +1707,41 @@ def _get_settle_price(end_ts: int) -> tuple[float, str]:
     return 0.0, "无"
 
 
-SETTLE_RTDS_WAIT = 5  # 等待 RTDS 0秒价格的秒数
-SETTLE_LATE_GRACE = 10  # 结算宽限期 (秒): 等待 Activity API 迟到交易追补
+SETTLE_LATE_GRACE = 12  # 结算宽限期 (秒): 等待 RTDS 边界价到达 + Activity API 迟到交易追补
 
 
 def _settle_pending():
-    """创建 _pending_settle 后:
-    始终等待宽限期 (SETTLE_LATE_GRACE), 让 Activity API 迟到交易追补到 _pending_settle。
-    宽限期内同步等待 RTDS 结算价到达; 超时则用 Buffer 回溯。
+    """创建 _pending_settle 后, 始终等待 SETTLE_LATE_GRACE 秒再结算。
+    宽限期内:
+      - RTDS 边界价自然写入 _rtds_boundary (RTDS handler 不再直接结算)
+      - Activity API 迟到交易自然追补到 _pending_settle
+    宽限期结束后, _get_settle_price() 采用最优价格源结算。
     """
     ps = state._pending_settle
     if not ps:
         return
 
-    # 先尝试获取结算价 (可能已有 RTDS 边界缓存)
-    settle_price, src = _get_settle_price(ps["end_ts"])
+    print(f"[结算] 等待 RTDS 边界价 + 迟到交易追补 ({SETTLE_LATE_GRACE}s)...")
 
-    if src == "RTDS" and settle_price > 0:
-        # RTDS 已有, 但仍需等宽限期让迟到交易追补
-        print(f"[结算] RTDS价格就绪, 等待迟到交易追补 ({SETTLE_LATE_GRACE}s)...")
-
-        async def _grace_settle():
-            await asyncio.sleep(SETTLE_LATE_GRACE)
-            if not state._pending_settle:
-                return  # 已被其他路径结算
-            ps2 = state._pending_settle
-            _do_settle(settle_price, ps2["ptb"] or 0.0, src)
-
-        try:
-            asyncio.get_event_loop().create_task(_grace_settle())
-        except RuntimeError:
-            _do_settle(settle_price, ps["ptb"] or 0.0, src)
-        return
-
-    # RTDS 尚未到达, 延迟等待 — RTDS inline handler 可能在这期间结算
-    total_wait = max(SETTLE_RTDS_WAIT, SETTLE_LATE_GRACE)
-    print(f"[结算] 等待RTDS精确价格+迟到交易 ({total_wait}s)...")
-
-    async def _delayed_settle():
-        await asyncio.sleep(total_wait)
+    async def _grace_settle():
+        await asyncio.sleep(SETTLE_LATE_GRACE)
         if not state._pending_settle:
-            return  # 已被 RTDS inline 结算
+            return  # 已被其他路径结算 (不应发生)
         ps2 = state._pending_settle
         settle_price, src = _get_settle_price(ps2["end_ts"])
         if settle_price <= 0:
             settle_price = state.btc_price
-            src = "当前价(延迟)"
+            src = "当前价"
         if settle_price > 0:
-            _do_settle(settle_price, ps2["ptb"] or 0.0, f"{src}(延迟)")
+            _do_settle(settle_price, ps2["ptb"] or 0.0, src)
         else:
-            print("[结算] ⚠ 延迟后仍无结算价, 等待超时回退")
+            print("[结算] ⚠ 宽限期后仍无结算价, 等待超时回退")
 
     try:
-        asyncio.get_event_loop().create_task(_delayed_settle())
+        asyncio.get_event_loop().create_task(_grace_settle())
     except RuntimeError:
         # 无事件循环 (不应发生), 直接结算
+        settle_price, src = _get_settle_price(ps["end_ts"])
         if settle_price > 0:
             _do_settle(settle_price, ps["ptb"] or 0.0, src)
 
