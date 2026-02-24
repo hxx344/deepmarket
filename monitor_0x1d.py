@@ -615,6 +615,139 @@ class MonitorState:
             prev_dir = cur_dir
         return changes
 
+    # ── RTDS-PTB 比对特征方法 ──
+
+    def calc_rtds_implied_prob(self, ref_ts: float = 0.0) -> float:
+        """
+        根据 RTDS 价格相对 PTB 的距离 + 当前波动率,
+        用 logistic 函数估算 UP 的公允概率。
+
+        逻辑: distance / volatility 越大, UP 概率越接近 1;
+               distance / volatility 越负, UP 概率越接近 0。
+        """
+        if self.window_ptb <= 0:
+            return 0.50
+        btc_p = self._price_at(self.btc_price_buffer, ref_ts) if ref_ts > 0 else self.btc_price
+        if btc_p <= 0:
+            return 0.50
+        delta = btc_p - self.window_ptb
+        vol = self.calc_btc_volatility(60.0, ref_ts)
+        if vol < 0.5:
+            vol = 0.5  # 防止除零, 最小波动 $0.5
+        z = delta / vol * 2.0  # 缩放因子, 使 ±1vol 大致对应 ±0.27 概率偏离
+        prob = 1.0 / (1.0 + math.exp(-z))
+        return max(0.01, min(0.99, prob))
+
+    def calc_pm_rtds_prob_gap(self, ref_ts: float = 0.0) -> float:
+        """
+        PM 市场定价 vs RTDS 隐含概率的偏差。
+        正值 = 市场高估 UP (相对 BTC 实际位置); 负值 = 市场低估 UP。
+        这个偏差可能蕴含 alpha: 若 0x1d 在市场低估时买入, 说明他利用了定价滞后。
+        """
+        pm_up = self.up_price
+        if ref_ts > 0:
+            snap = self._pm_state_at(ref_ts)
+            pm_up = snap.get("up", self.up_price)
+        implied = self.calc_rtds_implied_prob(ref_ts)
+        return round(pm_up - implied, 4) if pm_up > 0 else 0.0
+
+    def calc_ptb_dist_vs_vol(self, ref_ts: float = 0.0) -> float:
+        """
+        PTB 距离 / 波动率 (归一化距离)。
+        > 1 = BTC 明显高于 PTB (超过 1 个标准波动); < -1 = 明显低于。
+        接近 0 = 距离不显著, 方向不确定。
+        """
+        if self.window_ptb <= 0:
+            return 0.0
+        btc_p = self._price_at(self.btc_price_buffer, ref_ts) if ref_ts > 0 else self.btc_price
+        if btc_p <= 0:
+            return 0.0
+        vol = self.calc_btc_volatility(60.0, ref_ts)
+        if vol < 0.5:
+            vol = 0.5
+        return (btc_p - self.window_ptb) / vol
+
+    def calc_ptb_cross_count(self, ref_ts: float = 0.0) -> int:
+        """
+        在本窗口内, BTC 价格穿越 PTB 的次数。
+        穿越次数多 = 方向不确定 / 高争议; 0 次 = 单边行情。
+        """
+        if self.window_ptb <= 0 or self.window_start_ts <= 0:
+            return 0
+        ptb = self.window_ptb
+        now_ts = ref_ts if ref_ts > 0 else (self.btc_price_buffer[-1][0] if self.btc_price_buffer else 0)
+        cutoff = float(self.window_start_ts)
+        prices = [p for ts, p in self.btc_price_buffer if cutoff <= ts <= now_ts]
+        if len(prices) < 2:
+            return 0
+        crosses = 0
+        above = prices[0] > ptb
+        for p in prices[1:]:
+            new_above = p > ptb
+            if new_above != above:
+                crosses += 1
+                above = new_above
+        return crosses
+
+    def calc_ptb_time_above_ratio(self, ref_ts: float = 0.0) -> float:
+        """
+        本窗口内 BTC 价格处于 PTB 之上的时间占比 (0~1)。
+        0.9 = 几乎全程在 PTB 上方 (强 UP);
+        0.1 = 几乎全程在下方 (强 DN);
+        0.5 = 各半 (不确定)。
+        """
+        if self.window_ptb <= 0 or self.window_start_ts <= 0:
+            return 0.5
+        ptb = self.window_ptb
+        now_ts = ref_ts if ref_ts > 0 else (self.btc_price_buffer[-1][0] if self.btc_price_buffer else 0)
+        cutoff = float(self.window_start_ts)
+        items = [(ts, p) for ts, p in self.btc_price_buffer if cutoff <= ts <= now_ts]
+        if len(items) < 2:
+            return 0.5
+        time_above = 0.0
+        total_time = 0.0
+        for i in range(1, len(items)):
+            dt = items[i][0] - items[i - 1][0]
+            if dt <= 0:
+                continue
+            total_time += dt
+            if items[i - 1][1] > ptb:
+                time_above += dt
+        return time_above / total_time if total_time > 0 else 0.5
+
+    def calc_ptb_dist_velocity(self, window_secs: float = 5.0, ref_ts: float = 0.0) -> float:
+        """
+        PTB 距离变化速度 ($/s): 正值 = BTC 在远离 PTB 向上; 负值 = 远离向下/回归。
+        衡量当前价格离开 PTB 的紧迫程度。
+        """
+        if self.window_ptb <= 0 or len(self.btc_price_buffer) < 2:
+            return 0.0
+        ptb = self.window_ptb
+        now_ts = ref_ts if ref_ts > 0 else self.btc_price_buffer[-1][0]
+        p_now = self._price_at(self.btc_price_buffer, now_ts) or self.btc_price
+        p_past = self._price_at(self.btc_price_buffer, now_ts - window_secs)
+        if p_now <= 0 or p_past <= 0:
+            return 0.0
+        dist_now = p_now - ptb
+        dist_past = p_past - ptb
+        return (dist_now - dist_past) / window_secs
+
+    def calc_ptb_extreme_dist(self, ref_ts: float = 0.0) -> tuple[float, float]:
+        """
+        本窗口内 BTC 距 PTB 的最大正距离和最大负距离。
+        返回 (max_above, max_below), 其中 max_below <= 0。
+        用于衡量窗口内的极端行情。
+        """
+        if self.window_ptb <= 0 or self.window_start_ts <= 0:
+            return (0.0, 0.0)
+        ptb = self.window_ptb
+        now_ts = ref_ts if ref_ts > 0 else (self.btc_price_buffer[-1][0] if self.btc_price_buffer else 0)
+        cutoff = float(self.window_start_ts)
+        dists = [p - ptb for ts, p in self.btc_price_buffer if cutoff <= ts <= now_ts]
+        if not dists:
+            return (0.0, 0.0)
+        return (max(dists), min(dists))
+
     # ── 历史时刻查询辅助方法 ──
 
     @staticmethod
@@ -640,128 +773,264 @@ class MonitorState:
             "dn_bid": self.dn_bid, "dn_ask": self.dn_ask,
         }
 
+    # ── 跨窗口状态辅助方法 ──
+
+    def _cross_window_features(self) -> dict:
+        """从 settled_windows 计算跨窗口状态特征"""
+        settled = self.settled_windows
+        if not settled:
+            return {"prev_won": 0, "prev_pnl": 0.0, "session_pnl": 0.0,
+                    "session_wr": 50.0, "win_streak": 0}
+
+        last = settled[-1]
+        prev_won = 1.0 if last["pnl"] > 0 else -1.0
+        prev_pnl = last["pnl"]
+
+        # 最近 10 个窗口
+        recent = settled[-10:]
+        session_pnl = sum(w["pnl"] for w in recent)
+        wins = sum(1 for w in recent if w["pnl"] > 0)
+        session_wr = wins / len(recent) * 100.0
+
+        # 连赢/连输
+        streak = 0
+        last_dir = 1 if settled[-1]["pnl"] > 0 else -1
+        for w in reversed(settled):
+            d = 1 if w["pnl"] > 0 else -1
+            if d == last_dir:
+                streak += 1
+            else:
+                break
+        win_streak = streak * last_dir  # +N=连赢, -N=连输
+
+        return {"prev_won": prev_won, "prev_pnl": round(prev_pnl, 2),
+                "session_pnl": round(session_pnl, 2),
+                "session_wr": round(session_wr, 1),
+                "win_streak": win_streak}
+
+    def calc_btc_range_pct(self, ref_ts: float = 0.0) -> float:
+        """BTC 在当前窗口内的高低幅度 (bps)
+        从 window_start_ts 到 ref_ts, 计算 (max - min) / ptb * 10000
+        """
+        if self.window_ptb <= 0 or self.window_start_ts <= 0:
+            return 0.0
+        now_ts = ref_ts if ref_ts > 0 else (
+            self.btc_price_buffer[-1][0] if self.btc_price_buffer else 0)
+        cutoff = float(self.window_start_ts)
+        prices = [p for ts, p in self.btc_price_buffer if cutoff <= ts <= now_ts]
+        if len(prices) < 2:
+            return 0.0
+        return (max(prices) - min(prices)) / self.window_ptb * 10000
+
+    def calc_pm_mid_velocity(self, window_secs: float, ref_ts: float = 0.0) -> float:
+        """PM 中间价 (combined/2) 在 window_secs 内的变化速率 (¢/s)
+        反映市场对 BTC 走势的定价反应速度
+        """
+        if not self.pm_price_history:
+            return 0.0
+        now_ts = ref_ts if ref_ts > 0 else self.pm_price_history[-1]["ts"]
+        cutoff = now_ts - window_secs
+        # 找 cutoff 附近的起点
+        start_snap = None
+        end_snap = None
+        for snap in self.pm_price_history:
+            if snap["ts"] >= cutoff and start_snap is None:
+                start_snap = snap
+        for snap in reversed(self.pm_price_history):
+            if snap["ts"] <= now_ts:
+                end_snap = snap
+                break
+        if not start_snap or not end_snap or start_snap is end_snap:
+            return 0.0
+        dt = end_snap["ts"] - start_snap["ts"]
+        if dt < 0.5:
+            return 0.0
+        # combined = UP + DN, 中间价 = UP price
+        delta = end_snap["up"] - start_snap["up"]
+        return delta / dt * 100  # 转为 ¢/s
+
+    def calc_side_switch_rate(self) -> float:
+        """当前窗口内方向切换次数 / 总交易数"""
+        trades = list(self.trades_0x1d)
+        if len(trades) < 2:
+            return 0.0
+        switches = sum(1 for i in range(1, len(trades))
+                       if trades[i]["side"] != trades[i-1]["side"])
+        return switches / len(trades)
+
+    def calc_dominant_side_ratio(self) -> float:
+        """份额加权的方向比: UP / (UP + DN), 范围 [0, 1]
+        0.5 = 均衡, >0.5 = 偏UP, <0.5 = 偏DN
+        """
+        total = self.cum_up_shares + self.cum_dn_shares
+        if total <= 0:
+            return 0.5
+        return self.cum_up_shares / total
+
     # ── 多特征相关性引擎 ──
-    # 特征定义: (key_in_snap, display_name, category)
-    FEATURE_DEFS: list[tuple[str, str, str]] = [
+    # 特征定义: (key_in_snap, display_name, category, causality)
+    #   causality = "exo"  → 外生特征: 纯市场状态, 不受交易者行为影响
+    #   causality = "endo" → 内生特征: 仓位/交易节奏, 由交易者自身决策产生
+    #   分层用途:
+    #     exo only  → 提取纯市场信号 ("什么行情下他会入场")
+    #     exo + endo → 复制完整策略 ("信号 + 风险管理")
+    FEATURE_DEFS: list[tuple[str, str, str, str]] = [
         # RTDS (Chainlink) 动量
-        ("mom_1s",   "CL动量 1s",    "RTDS"),
-        ("mom_3s",   "CL动量 3s",    "RTDS"),
-        ("mom_5s",   "CL动量 5s",    "RTDS"),
-        ("mom_10s",  "CL动量 10s",   "RTDS"),
-        ("mom_15s",  "CL动量 15s",   "RTDS"),
-        ("mom_30s",  "CL动量 30s",   "RTDS"),
+        ("mom_1s",   "CL动量 1s",    "RTDS",  "exo"),
+        ("mom_3s",   "CL动量 3s",    "RTDS",  "exo"),
+        ("mom_5s",   "CL动量 5s",    "RTDS",  "exo"),
+        ("mom_10s",  "CL动量 10s",   "RTDS",  "exo"),
+        ("mom_15s",  "CL动量 15s",   "RTDS",  "exo"),
+        ("mom_30s",  "CL动量 30s",   "RTDS",  "exo"),
         # Binance 动量
-        ("bn_mom_1s",  "BN动量 1s",   "BN"),
-        ("bn_mom_3s",  "BN动量 3s",   "BN"),
-        ("bn_mom_5s",  "BN动量 5s",   "BN"),
-        ("bn_mom_10s", "BN动量 10s",  "BN"),
-        ("bn_mom_15s", "BN动量 15s",  "BN"),
-        ("bn_mom_30s", "BN动量 30s",  "BN"),
+        ("bn_mom_1s",  "BN动量 1s",   "BN",   "exo"),
+        ("bn_mom_3s",  "BN动量 3s",   "BN",   "exo"),
+        ("bn_mom_5s",  "BN动量 5s",   "BN",   "exo"),
+        ("bn_mom_10s", "BN动量 10s",  "BN",   "exo"),
+        ("bn_mom_15s", "BN动量 15s",  "BN",   "exo"),
+        ("bn_mom_30s", "BN动量 30s",  "BN",   "exo"),
         # BTC 状态 (Chainlink)
-        ("btc_delta_ptb",  "CL-PTB差",     "RTDS"),
-        ("btc_delta_pct",  "CL-PTB差%",    "RTDS"),
-        ("btc_vol_10s",    "CL波动 10s",   "RTDS"),
-        ("btc_vol_30s",    "CL波动 30s",   "RTDS"),
+        ("btc_delta_ptb",  "CL-PTB差",     "RTDS",  "exo"),
+        ("btc_delta_pct",  "CL-PTB差%",    "RTDS",  "exo"),
+        ("btc_vol_10s",    "CL波动 10s",   "RTDS",  "exo"),
+        ("btc_vol_30s",    "CL波动 30s",   "RTDS",  "exo"),
         # BTC 状态 (Binance)
-        ("bn_delta_ptb",   "BN-PTB差",     "BN"),
-        ("bn_delta_pct",   "BN-PTB差%",    "BN"),
-        ("bn_vol_10s",     "BN波动 10s",   "BN"),
-        ("bn_vol_30s",     "BN波动 30s",   "BN"),
+        ("bn_delta_ptb",   "BN-PTB差",     "BN",   "exo"),
+        ("bn_delta_pct",   "BN-PTB差%",    "BN",   "exo"),
+        ("bn_vol_10s",     "BN波动 10s",   "BN",   "exo"),
+        ("bn_vol_30s",     "BN波动 30s",   "BN",   "exo"),
         # RTDS vs Binance 差异
-        ("cl_bn_spread",   "CL-BN价差",    "差异"),
-        ("cl_bn_mom_diff_5s",  "动量差 5s",  "差异"),
-        ("cl_bn_mom_diff_10s", "动量差 10s", "差异"),
-        # PM 市场
-        ("up_price",       "UP报价",       "PM"),
-        ("dn_price",       "DN报价",       "PM"),
-        ("pm_spread",      "PM价差",       "PM"),
-        ("pm_edge",        "PM边际",       "PM"),
-        ("up_bid",         "UP Bid",       "PM"),
-        ("up_ask",         "UP Ask",       "PM"),
-        # 窗口时序
-        ("elapsed",        "窗口进度s",    "时序"),
-        ("elapsed_pct",    "窗口进度%",    "时序"),
-        # 仓位状态
-        ("pos_imbalance",  "仓位偏差",     "仓位"),
-        ("cum_trades",     "累积单数",     "仓位"),
-        ("trade_velocity", "下单速度/min", "仓位"),
+        ("cl_bn_spread",   "CL-BN价差",    "差异", "exo"),
+        ("cl_bn_mom_diff_5s",  "动量差 5s",  "差异", "exo"),
+        ("cl_bn_mom_diff_10s", "动量差 10s", "差异", "exo"),
+        # PM 市场 (外生: 全市场报价, 非交易者个人持仓)
+        ("up_price",       "UP报价",       "PM",   "exo"),
+        ("dn_price",       "DN报价",       "PM",   "exo"),
+        ("pm_edge",        "PM边际",       "PM",   "exo"),
+        ("up_bid",         "UP Bid",       "PM",   "exo"),
+        ("up_ask",         "UP Ask",       "PM",   "exo"),
+        # 窗口时序 (外生: 时间进度是客观的)
+        ("elapsed",        "窗口进度s",    "时序", "exo"),
+        ("elapsed_pct",    "窗口进度%",    "时序", "exo"),
+        # ── 内生特征: 仓位状态 (由交易者自身决策产生) ──
+        ("pos_imbalance",  "仓位偏差",     "仓位", "endo"),
+        ("cum_trades",     "累积单数",     "仓位", "endo"),
+        ("trade_velocity", "下单速度/min", "仓位", "endo"),
         # ── 扩展特征 (策略蒸馏) ──
         # 长周期动量
-        ("mom_60s",    "CL动量 60s",   "RTDS"),
-        ("mom_120s",   "CL动量 120s",  "RTDS"),
-        ("bn_mom_60s",  "BN动量 60s",  "BN"),
-        ("bn_mom_120s", "BN动量 120s", "BN"),
+        ("mom_60s",    "CL动量 60s",   "RTDS",  "exo"),
+        ("mom_120s",   "CL动量 120s",  "RTDS",  "exo"),
+        ("bn_mom_60s",  "BN动量 60s",  "BN",   "exo"),
+        ("bn_mom_120s", "BN动量 120s", "BN",   "exo"),
         # 扩展波动率
-        ("btc_vol_60s", "CL波动 60s",  "RTDS"),
-        ("bn_vol_60s",  "BN波动 60s",  "BN"),
+        ("btc_vol_60s", "CL波动 60s",  "RTDS",  "exo"),
+        ("bn_vol_60s",  "BN波动 60s",  "BN",   "exo"),
         # 动量加速度 (短期 - 长期动量差)
-        ("mom_accel_5s",     "CL加速 5-10s",  "RTDS"),
-        ("mom_accel_10s",    "CL加速 10-30s", "RTDS"),
-        ("bn_mom_accel_5s",  "BN加速 5-10s",  "BN"),
+        ("mom_accel_5s",     "CL加速 5-10s",  "RTDS",  "exo"),
+        ("mom_accel_10s",    "CL加速 10-30s", "RTDS",  "exo"),
+        ("bn_mom_accel_5s",  "BN加速 5-10s",  "BN",   "exo"),
         # 盘口宽度
-        ("up_ba_spread", "UP盘口宽度", "PM"),
-        ("dn_ba_spread", "DN盘口宽度", "PM"),
-        ("dn_bid",       "DN Bid",     "PM"),
-        ("dn_ask",       "DN Ask",     "PM"),
+        ("up_ba_spread", "UP盘口宽度", "PM",   "exo"),
+        ("dn_ba_spread", "DN盘口宽度", "PM",   "exo"),
+        ("dn_bid",       "DN Bid",     "PM",   "exo"),
+        ("dn_ask",       "DN Ask",     "PM",   "exo"),
         # 方向信号
-        ("btc_above_ptb",    "BTC>PTB",       "信号"),
-        # 交易节奏
-        ("time_since_last",  "距上笔间隔s",   "时序"),
-        ("same_side_streak", "连续同向笔",    "仓位"),
-        # ── 新增: 趋势强度 ──
-        ("cl_trend_30s",     "CL趋势 30s",   "RTDS"),
-        ("cl_trend_60s",     "CL趋势 60s",   "RTDS"),
-        ("cl_trend_120s",    "CL趋势 120s",  "RTDS"),
-        ("bn_trend_30s",     "BN趋势 30s",   "BN"),
-        ("bn_trend_60s",     "BN趋势 60s",   "BN"),
-        # ── 新增: 价格百分位 ──
-        ("cl_pctl_60s",      "CL百分位 60s", "RTDS"),
-        ("cl_pctl_300s",     "CL百分位 300s","RTDS"),
-        ("bn_pctl_60s",      "BN百分位 60s", "BN"),
-        # ── 新增: 动量 Z-score ──
-        ("cl_mom_z_5s",      "CL Z-score 5s", "RTDS"),
-        ("cl_mom_z_10s",     "CL Z-score 10s","RTDS"),
-        ("bn_mom_z_5s",      "BN Z-score 5s", "BN"),
-        # ── 新增: 震荡指标 ──
-        ("cl_dir_changes_30s", "CL反转次数 30s", "RTDS"),
-        ("cl_dir_changes_60s", "CL反转次数 60s", "RTDS"),
-        # ── 新增: 长周期动量 ──
-        ("mom_180s",         "CL动量 180s",  "RTDS"),
-        ("mom_300s",         "CL动量 300s",  "RTDS"),
-        ("bn_mom_180s",      "BN动量 180s",  "BN"),
-        # ── 新增: 扩展波动率 ──
-        ("btc_vol_120s",     "CL波动 120s",  "RTDS"),
-        ("bn_vol_120s",      "BN波动 120s",  "BN"),
-        # ── 新增: 扩展加速度 ──
-        ("mom_accel_30s",    "CL加速 30-60s", "RTDS"),
-        ("bn_mom_accel_10s", "BN加速 10-30s", "BN"),
-        # ── 新增: 仓位 ──
-        ("cum_up_shares",    "累UP量",        "仓位"),
-        ("cum_dn_shares",    "累DN量",        "仓位"),
-        ("cum_up_cost",      "累UP成本",      "仓位"),
-        ("cum_dn_cost",      "累DN成本",      "仓位"),
-        ("avg_up_price",     "UP均价",        "仓位"),
-        ("avg_dn_price",     "DN均价",        "仓位"),
-        # ── 新增: PM定价效率 ──
-        ("up_price_vs_fair", "UP偏离公允",    "PM"),
-        ("dn_price_vs_fair", "DN偏离公允",    "PM"),
-        # ── 新增: 跨源一致性 ──
-        ("cl_bn_trend_agree","CL-BN趋势一致","差异"),
-        # ── 新增: Burst 特征 ──
-        ("burst_seq",        "Burst内序号",   "时序"),
-        ("is_burst",         "是否Burst",     "时序"),
+        ("btc_above_ptb",    "BTC>PTB",       "信号", "exo"),
+        # 交易节奏 (内生: 取决于交易者过往操作)
+        ("time_since_last",  "距上笔间隔s",   "时序", "endo"),
+        ("same_side_streak", "连续同向笔",    "仓位", "endo"),
+        # 趋势强度
+        ("cl_trend_30s",     "CL趋势 30s",   "RTDS",  "exo"),
+        ("cl_trend_60s",     "CL趋势 60s",   "RTDS",  "exo"),
+        ("cl_trend_120s",    "CL趋势 120s",  "RTDS",  "exo"),
+        ("bn_trend_30s",     "BN趋势 30s",   "BN",   "exo"),
+        ("bn_trend_60s",     "BN趋势 60s",   "BN",   "exo"),
+        # 价格百分位
+        ("cl_pctl_60s",      "CL百分位 60s", "RTDS", "exo"),
+        ("cl_pctl_300s",     "CL百分位 300s","RTDS", "exo"),
+        ("bn_pctl_60s",      "BN百分位 60s", "BN",  "exo"),
+        # 动量 Z-score
+        ("cl_mom_z_5s",      "CL Z-score 5s", "RTDS", "exo"),
+        ("cl_mom_z_10s",     "CL Z-score 10s","RTDS", "exo"),
+        ("bn_mom_z_5s",      "BN Z-score 5s", "BN",  "exo"),
+        # 震荡指标
+        ("cl_dir_changes_30s", "CL反转次数 30s", "RTDS", "exo"),
+        ("cl_dir_changes_60s", "CL反转次数 60s", "RTDS", "exo"),
+        # 长周期动量
+        ("mom_180s",         "CL动量 180s",  "RTDS",  "exo"),
+        ("mom_300s",         "CL动量 300s",  "RTDS",  "exo"),
+        ("bn_mom_180s",      "BN动量 180s",  "BN",   "exo"),
+        # 扩展波动率
+        ("btc_vol_120s",     "CL波动 120s",  "RTDS",  "exo"),
+        ("bn_vol_120s",      "BN波动 120s",  "BN",   "exo"),
+        # 扩展加速度
+        ("mom_accel_30s",    "CL加速 30-60s", "RTDS",  "exo"),
+        ("bn_mom_accel_10s", "BN加速 10-30s", "BN",   "exo"),
+        # ── 内生特征: 仓位细节 ──
+        ("cum_up_shares",    "累UP量",        "仓位", "endo"),
+        ("cum_dn_shares",    "累DN量",        "仓位", "endo"),
+        ("cum_up_cost",      "累UP成本",      "仓位", "endo"),
+        ("cum_dn_cost",      "累DN成本",      "仓位", "endo"),
+        ("avg_up_price",     "UP均价",        "仓位", "endo"),
+        ("avg_dn_price",     "DN均价",        "仓位", "endo"),
+        # PM定价效率
+        ("up_price_vs_fair", "UP偏离公允",    "PM",   "exo"),
+        ("dn_price_vs_fair", "DN偏离公允",    "PM",   "exo"),
+        # 跨源一致性
+        ("cl_bn_trend_agree","CL-BN趋势一致","差异", "exo"),
+        # Burst 特征 (内生: burst是交易者自己的连续下单行为)
+        ("burst_seq",        "Burst内序号",   "时序", "endo"),
+        ("is_burst",         "是否Burst",     "时序", "endo"),
+        # RTDS-PTB 比对特征
+        ("rtds_implied_prob",  "RTDS隐含UP概率",  "RTDS-PTB", "exo"),
+        ("pm_rtds_prob_gap",   "PM-RTDS概率偏差", "RTDS-PTB", "exo"),
+        ("ptb_dist_vs_vol",    "PTB距离/波动",    "RTDS-PTB", "exo"),
+        ("ptb_cross_count",    "PTB穿越次数",     "RTDS-PTB", "exo"),
+        ("ptb_time_above",     "PTB上方时间比",    "RTDS-PTB", "exo"),
+        ("ptb_dist_vel_5s",    "PTB距离速度5s",   "RTDS-PTB", "exo"),
+        ("ptb_max_above",      "PTB最大正距离",    "RTDS-PTB", "exo"),
+        ("ptb_max_below",      "PTB最大负距离",    "RTDS-PTB", "exo"),
+        # ── 时间特征 (UTC, 已在 trade snap 中计算) ──
+        ("hour_utc",           "UTC时",            "时序",  "exo"),
+        ("minute_utc",         "UTC分",            "时序",  "exo"),
+        ("day_of_week",        "星期几",           "时序",  "exo"),
+        ("us_session",         "美股盘",           "时序",  "exo"),
+        ("asia_session",       "亚洲盘",           "时序",  "exo"),
+        ("euro_session",       "欧洲盘",           "时序",  "exo"),
+        # ── 跨窗口状态 (由历史结算结果驱动) ──
+        ("prev_won",           "前窗口赢",         "跨窗口", "endo"),
+        ("prev_pnl",           "前窗口PnL",        "跨窗口", "endo"),
+        ("session_pnl",        "会话累积PnL",      "跨窗口", "endo"),
+        ("session_wr",         "近期胜率%",        "跨窗口", "endo"),
+        ("win_streak",         "连赢/连输",        "跨窗口", "endo"),
+        # ── 窗口内交易强度 ──
+        ("trade_density",      "交易密度/min",     "仓位",  "endo"),
+        ("cum_volume",         "累积交易额",       "仓位",  "endo"),
+        ("side_switch_rate",   "方向切换率",       "仓位",  "endo"),
+        ("dominant_side_ratio","多空份额比",       "仓位",  "endo"),
+        # ── BTC 窗口走势 ──
+        ("btc_range_pct",      "BTC窗口幅bps",    "RTDS",  "exo"),
+        # ── PM 报价速度 ──
+        ("pm_mid_vel_10s",     "PM速度10s",       "PM",    "exo"),
+        ("pm_mid_vel_30s",     "PM速度30s",       "PM",    "exo"),
     ]
 
-    def calc_feature_correlations(self, snaps: list[dict]) -> dict:
-        """计算交易方向(UP=+1,DN=-1)与所有特征的 Pearson r + 方向一致率
-        返回: {features: [{key, name, cat, r, abs_r, agree, rank}], n, best_key, best_name}
+    def calc_feature_correlations(self, snaps: list[dict], scope: str = "all") -> dict:
+        """计算交易方向(UP=+1,DN=-1)与特征的 Pearson r + 方向一致率
+        scope: "all"=全部特征, "exo"=仅外生, "endo"=仅内生
+        返回: {features: [{key, name, cat, causality, r, abs_r, agree, rank}], n, best_key, best_name, scope}
         """
         n = len(snaps)
         if n < 3:
-            return {"features": [], "n": n, "best_key": "--", "best_name": "--"}
+            return {"features": [], "n": n, "best_key": "--", "best_name": "--", "scope": scope}
         sides = [1.0 if s.get("side") == "UP" else -1.0 for s in snaps]
         results = []
-        for key, name, cat in self.FEATURE_DEFS:
+        for key, name, cat, causality in self.FEATURE_DEFS:
+            # 按因果性过滤
+            if scope == "exo" and causality != "exo":
+                continue
+            if scope == "endo" and causality != "endo":
+                continue
             vals = [s.get(key, 0.0) for s in snaps]
             # 跳过全零特征
             if all(v == 0 for v in vals):
@@ -773,7 +1042,7 @@ class MonitorState:
             non_zero = sum(1 for v in vals if v != 0)
             agree = matched / non_zero * 100 if non_zero > 0 else 0.0
             results.append({
-                "key": key, "name": name, "cat": cat,
+                "key": key, "name": name, "cat": cat, "causality": causality,
                 "r": round(r, 4), "abs_r": round(abs(r), 4),
                 "agree": round(agree, 1),
             })
@@ -787,6 +1056,7 @@ class MonitorState:
             "n": n,
             "best_key": best.get("key", "--"),
             "best_name": best.get("name", "--"),
+            "scope": scope,
         }
 
     def _aligned_bn_history(self) -> list[dict]:
@@ -889,10 +1159,16 @@ class MonitorState:
 
             # BTC
             "btc_price": round(self.btc_price, 2),
+            "bn_price": round(self.bn_price, 2),
             "btc_momentum": round(momentum, 2),
             "btc_momentum_1s": round(mom_1s, 2),
             "btc_momentum_3s": round(mom_3s, 2),
             "btc_momentum_5s": round(mom_5s, 2),
+            # BTC vs PTB (与 FEATURE_DEFS 命名一致)
+            "btc_delta_ptb": round(self.btc_price - self.window_ptb, 2) if self.window_ptb > 0 else 0,
+            "btc_delta_pct": round((self.btc_price - self.window_ptb) / self.window_ptb * 10000, 2) if self.window_ptb > 0 else 0,  # bps
+            "bn_delta_ptb": round(self.bn_price - self.window_ptb, 2) if self.window_ptb > 0 and self.bn_price > 0 else 0,
+            "bn_delta_pct": round((self.bn_price - self.window_ptb) / self.window_ptb * 10000, 2) if self.window_ptb > 0 and self.bn_price > 0 else 0,  # bps
             "btc_history": list(self.btc_history)[-120:],
             # Binance 历史: 对齐到 btc_history 的时间范围 (避免 X 轴不一致)
             "bn_history": self._aligned_bn_history(),
@@ -943,15 +1219,34 @@ class MonitorState:
             "settled_wins": settled_wins,
             "settled_total": settled_total,
 
+            # 跨窗口状态
+            "cross_window": self._cross_window_features(),
+
             # 动量 + 下单关联
             "momentum_history": list(self.momentum_history)[-300:],
             "trade_momentum_snaps": self.trade_momentum_snaps[-200:],
 
             # 多特征相关性分析 (策略逆向)
+            # all = 全部特征 (完整策略: 信号 + 风险管理)
             "feature_corr_window": self.calc_feature_correlations(self.trade_momentum_snaps),
             "feature_corr_global": self.calc_feature_correlations(
                 list(self.trade_momentum_all) + self.trade_momentum_snaps
             ),
+            # exo = 仅外生特征 (纯市场信号, 排除仓位状态的影响)
+            "feature_corr_exo_window": self.calc_feature_correlations(self.trade_momentum_snaps, scope="exo"),
+            "feature_corr_exo_global": self.calc_feature_correlations(
+                list(self.trade_momentum_all) + self.trade_momentum_snaps, scope="exo"
+            ),
+
+            # ── RTDS-PTB 比对实时指标 ──
+            "rtds_implied_prob": round(self.calc_rtds_implied_prob(), 4),
+            "pm_rtds_prob_gap": round(self.calc_pm_rtds_prob_gap(), 4),
+            "ptb_dist_vs_vol": round(self.calc_ptb_dist_vs_vol(), 3),
+            "ptb_cross_count": self.calc_ptb_cross_count(),
+            "ptb_time_above": round(self.calc_ptb_time_above_ratio(), 3),
+            "ptb_dist_vel_5s": round(self.calc_ptb_dist_velocity(5.0), 2),
+            "ptb_max_above": round(self.calc_ptb_extreme_dist()[0], 2),
+            "ptb_max_below": round(self.calc_ptb_extreme_dist()[1], 2),
 
             # 状态
             "binance_ok": self.binance_connected,
@@ -2094,6 +2389,16 @@ async def poll_0x1d_activity():
                                 is_burst = 1.0 if burst_seq > 0 else 0.0
                             # BTC vs PTB 方向信号 (使用回溯价格)
                             btc_above_ptb = 1.0 if (btc_p > state.window_ptb and state.window_ptb > 0) else (-1.0 if state.window_ptb > 0 else 0.0)
+
+                            # ── RTDS-PTB 比对特征 (回溯到 ref_ts) ──
+                            rtds_implied_prob = state.calc_rtds_implied_prob(ref_ts)
+                            pm_rtds_prob_gap = state.calc_pm_rtds_prob_gap(ref_ts)
+                            ptb_dist_vs_vol = state.calc_ptb_dist_vs_vol(ref_ts)
+                            ptb_cross_count = state.calc_ptb_cross_count(ref_ts)
+                            ptb_time_above = state.calc_ptb_time_above_ratio(ref_ts)
+                            ptb_dist_vel_5s = state.calc_ptb_dist_velocity(5.0, ref_ts)
+                            ptb_max_above, ptb_max_below = state.calc_ptb_extreme_dist(ref_ts)
+
                             if len(_trades_list) >= 2:
                                 _prev_ts = _trades_list[-2].get("ts_chain", _trades_list[-2].get("ts", 0))
                                 time_since_last = ts_int - int(_prev_ts) if _prev_ts and int(_prev_ts) > 0 else 0
@@ -2107,11 +2412,38 @@ async def poll_0x1d_activity():
                                 else:
                                     break
 
+                            # ── 跨窗口状态特征 ──
+                            _cw = state._cross_window_features()
+
+                            # ── 窗口内交易强度特征 ──
+                            _elapsed_min = max(trade_elapsed / 60.0, 0.1)
+                            _trade_density = round(state.trade_count_window / _elapsed_min, 1)
+                            _cum_volume = round(state.cum_up_cost + state.cum_dn_cost, 2)
+                            _side_switch_rate = round(state.calc_side_switch_rate(), 3)
+                            _dominant_side_ratio = round(state.calc_dominant_side_ratio(), 3)
+
+                            # ── BTC 窗口走势 ──
+                            _btc_range_pct = round(state.calc_btc_range_pct(ref_ts), 2)
+
+                            # ── PM 报价速度 ──
+                            _pm_mid_vel_10s = round(state.calc_pm_mid_velocity(10.0, ref_ts), 4)
+                            _pm_mid_vel_30s = round(state.calc_pm_mid_velocity(30.0, ref_ts), 4)
+
                             state.trade_momentum_snaps.append({
                                 "elapsed": max(0, trade_elapsed),
                                 "elapsed_pct": round(elapsed_pct, 1),
                                 "side": side,
                                 "shares": round(shares, 2),
+                                # ── 交易类型分类 (用于分层蒸馏) ──
+                                # signal    = 信号驱动 (仓位平衡或顺仓方向下单)
+                                # rebalance = 仓位调整 (逆仓方向下单, 明显是在平衡仓位)
+                                "trade_type": (
+                                    "rebalance" if (
+                                        abs(pos_imbalance) > 0.3 and  # 仓位偏差超30%
+                                        ((pos_imbalance > 0 and side == "DN") or  # 偏UP → 买DN
+                                         (pos_imbalance < 0 and side == "UP"))    # 偏DN → 买UP
+                                    ) else "signal"
+                                ),
                                 # ── 时间修正元数据 ──
                                 "ref_ts": round(ref_ts, 3),
                                 "feature_latency": _feature_latency,
@@ -2149,7 +2481,6 @@ async def poll_0x1d_activity():
                                 # PM 报价 (回溯到 ref_ts)
                                 "up_price": round(pm_up, 4),
                                 "dn_price": round(pm_dn, 4),
-                                "pm_spread": round(pm_up + pm_dn - 1.0, 4),
                                 "pm_edge":  round(pm_edge, 4),
                                 "up_bid":   round(pm_up_bid, 4),
                                 "up_ask":   round(pm_up_ask, 4),
@@ -2215,6 +2546,15 @@ async def poll_0x1d_activity():
                                 # Burst 特征
                                 "burst_seq": burst_seq,
                                 "is_burst": is_burst,
+                                # ── RTDS-PTB 比对特征 ──
+                                "rtds_implied_prob": round(rtds_implied_prob, 4),
+                                "pm_rtds_prob_gap": round(pm_rtds_prob_gap, 4),
+                                "ptb_dist_vs_vol": round(ptb_dist_vs_vol, 3),
+                                "ptb_cross_count": ptb_cross_count,
+                                "ptb_time_above": round(ptb_time_above, 3),
+                                "ptb_dist_vel_5s": round(ptb_dist_vel_5s, 2),
+                                "ptb_max_above": round(ptb_max_above, 2),
+                                "ptb_max_below": round(ptb_max_below, 2),
                                 # ── 时间特征 (UTC) ──
                                 "hour_utc": datetime.fromtimestamp(ref_ts, tz=timezone.utc).hour,
                                 "minute_utc": datetime.fromtimestamp(ref_ts, tz=timezone.utc).minute,
@@ -2229,6 +2569,22 @@ async def poll_0x1d_activity():
                                 # 亚盘/欧盘/美盘连续标记
                                 "asia_session": 1 if 0 <= datetime.fromtimestamp(ref_ts, tz=timezone.utc).hour < 8 else 0,
                                 "euro_session": 1 if 7 <= datetime.fromtimestamp(ref_ts, tz=timezone.utc).hour < 16 else 0,
+                                # ── 跨窗口状态特征 ──
+                                "prev_won": _cw["prev_won"],
+                                "prev_pnl": _cw["prev_pnl"],
+                                "session_pnl": _cw["session_pnl"],
+                                "session_wr": _cw["session_wr"],
+                                "win_streak": _cw["win_streak"],
+                                # ── 窗口内交易强度 ──
+                                "trade_density": _trade_density,
+                                "cum_volume": _cum_volume,
+                                "side_switch_rate": _side_switch_rate,
+                                "dominant_side_ratio": _dominant_side_ratio,
+                                # ── BTC 窗口走势 ──
+                                "btc_range_pct": _btc_range_pct,
+                                # ── PM 报价速度 ──
+                                "pm_mid_vel_10s": _pm_mid_vel_10s,
+                                "pm_mid_vel_30s": _pm_mid_vel_30s,
                             })
                             # 持久化到数据库
                             _db_save_trade_snap(

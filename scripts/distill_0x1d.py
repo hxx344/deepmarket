@@ -97,7 +97,8 @@ def build_window_features(snaps_df: pd.DataFrame, settle_df: pd.DataFrame) -> pd
                  "cum_up_shares", "cum_dn_shares", "cum_up_cost", "cum_dn_cost",
                  "avg_up_price", "avg_dn_price", "pos_imbalance",
                  "trade_velocity", "time_since_last", "same_side_streak",
-                 "burst_seq", "is_burst"}
+                 "burst_seq", "is_burst",
+                 "trade_density", "cum_volume", "side_switch_rate", "dominant_side_ratio"}
     num_cols = [c for c in snaps_df.columns
                 if c not in meta_cols and snaps_df[c].dtype in ("float64", "int64", "float32")]
 
@@ -209,7 +210,7 @@ DIRECTION_FEATURES = [
     # 首笔 Binance 动量
     "first_bn_mom_1s", "first_bn_mom_3s", "first_bn_mom_5s", "first_bn_mom_10s",
     # 首笔 PM 报价
-    "first_up_price", "first_dn_price", "first_pm_edge", "first_pm_spread",
+    "first_up_price", "first_dn_price", "first_pm_edge",
     # 首笔 CL-BN 差异
     "first_cl_bn_spread", "first_cl_bn_mom_diff_5s",
     # 首笔趋势
@@ -227,11 +228,24 @@ DIRECTION_FEATURES = [
     "first_btc_above_ptb",
     # 入场时间
     "first_entry_elapsed",
+    # ── 新增: 时间特征 (时段/星期 — 数据表明显著影响胜率) ──
+    "first_hour_utc", "first_day_of_week", "first_us_session",
+    # ── 新增: RTDS-PTB 比对 ──
+    "first_rtds_implied_prob", "first_pm_rtds_prob_gap",
+    "first_ptb_dist_vs_vol", "first_ptb_time_above",
+    # ── 新增: PM 报价速度 ──
+    "first_pm_mid_vel_10s", "first_pm_mid_vel_30s",
+    # ── 新增: BTC 窗口走势 ──
+    "first_btc_range_pct",
+    # ── 新增: 跨窗口状态 (前一窗口影响当前策略) ──
+    "first_prev_won", "first_session_pnl", "first_session_wr", "first_win_streak",
     # 早期均值
     "early_mean_mom_5s", "early_mean_mom_10s",
     "early_mean_bn_mom_5s", "early_mean_bn_mom_10s",
     "early_mean_btc_vol_30s",
     "early_mean_cl_trend_30s",
+    # ── 新增: 早期 PM 速度 ──
+    "early_mean_pm_mid_vel_10s",
 ]
 
 
@@ -335,7 +349,7 @@ TIMING_FEATURES = [
     "bn_mom_1s", "bn_mom_3s", "bn_mom_5s", "bn_mom_10s",
     "bn_mom_30s", "bn_mom_60s",
     # PM 报价
-    "up_price", "dn_price", "pm_edge", "pm_spread",
+    "up_price", "dn_price", "pm_edge",
     "up_bid", "up_ask", "dn_bid", "dn_ask",
     "up_ba_spread", "dn_ba_spread",
     # 加速度
@@ -358,6 +372,19 @@ TIMING_FEATURES = [
     "elapsed", "elapsed_pct",
     # 仓位
     "pos_imbalance", "cum_trades", "trade_velocity",
+    # ── 新增: 时间特征 ──
+    "hour_utc", "day_of_week", "us_session",
+    # ── 新增: RTDS-PTB 比对 ──
+    "rtds_implied_prob", "pm_rtds_prob_gap",
+    "ptb_dist_vs_vol", "ptb_time_above",
+    # ── 新增: PM 报价速度 ──
+    "pm_mid_vel_10s", "pm_mid_vel_30s",
+    # ── 新增: 窗口内交易强度 ──
+    "trade_density", "cum_volume", "side_switch_rate", "dominant_side_ratio",
+    # ── 新增: BTC 窗口走势 ──
+    "btc_range_pct",
+    # ── 新增: 跨窗口状态 ──
+    "prev_won", "session_pnl", "session_wr", "win_streak",
 ]
 
 

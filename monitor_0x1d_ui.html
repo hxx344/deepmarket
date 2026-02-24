@@ -367,15 +367,34 @@
   <div class="card" style="grid-column: 1 / -1;">
     <div class="card-title">🔬 策略逆向 — 多特征关联度排行</div>
     <div style="margin-bottom:8px;font-size:11px;color:var(--muted)">
-      每笔 0x1d 交易采集 20+ 特征，实时计算 side(UP=+1,DN=-1) 与各特征的 Pearson r，按 |r| 降序排列。
+      每笔 0x1d 交易采集 88 特征，实时计算 side(UP=+1,DN=-1) 与各特征的 Pearson r。
       <span style="color:var(--green)">■</span>正相关(顺势) <span style="color:var(--red)">■</span>负相关(逆势)
+      <span style="margin-left:8px;font-size:9px;background:#1f6feb22;color:#58a6ff;padding:1px 4px;border-radius:3px">外生</span>=市场状态
+      <span style="font-size:9px;background:#da3633aa;color:#fff;padding:1px 4px;border-radius:3px">内生</span>=仓位(自循环❗)
     </div>
-    <!-- 特征排行表格 -->
-    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+    <!-- 视图切换 -->
+    <div style="display:flex;gap:6px;margin-bottom:10px">
+      <button onclick="fcSwitchView('all')" id="fc-tab-all" style="padding:3px 10px;font-size:10px;border:1px solid var(--border);border-radius:4px;background:var(--border);color:var(--text);cursor:pointer">📊 完整策略 (信号+风控)</button>
+      <button onclick="fcSwitchView('exo')" id="fc-tab-exo" style="padding:3px 10px;font-size:10px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--muted);cursor:pointer">🎯 纯市场信号 (仅外生)</button>
+    </div>
+    <script>
+      let _fcView = 'all';
+      function fcSwitchView(v) {
+        _fcView = v;
+        document.getElementById('fc-tab-all').style.background = v==='all' ? 'var(--border)' : 'transparent';
+        document.getElementById('fc-tab-all').style.color = v==='all' ? 'var(--text)' : 'var(--muted)';
+        document.getElementById('fc-tab-exo').style.background = v==='exo' ? 'var(--border)' : 'transparent';
+        document.getElementById('fc-tab-exo').style.color = v==='exo' ? 'var(--text)' : 'var(--muted)';
+        document.getElementById('fc-view-all').style.display = v==='all' ? 'flex' : 'none';
+        document.getElementById('fc-view-exo').style.display = v==='exo' ? 'flex' : 'none';
+      }
+    </script>
+    <!-- 视图: 全部特征 -->
+    <div id="fc-view-all" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px">
       <!-- 当前窗口 -->
       <div style="flex:1;min-width:340px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 14px;max-height:320px;overflow-y:auto">
         <div style="font-size:10px;color:var(--muted);margin-bottom:6px">
-          📊 当前窗口 (n=<span id="fc-w-n">0</span>) | 最强: <span id="fc-w-best" style="color:#d29922;font-weight:700">--</span>
+          📊 当前窗口 全部 (n=<span id="fc-w-n">0</span>) | 最强: <span id="fc-w-best" style="color:#d29922;font-weight:700">--</span>
         </div>
         <table style="width:100%;border-collapse:collapse;font-size:11px" id="fc-w-table">
           <thead>
@@ -394,7 +413,7 @@
       <!-- 全局累积 -->
       <div style="flex:1;min-width:340px;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 14px;max-height:320px;overflow-y:auto">
         <div style="font-size:10px;color:var(--muted);margin-bottom:6px">
-          📊 全局累积 (n=<span id="fc-g-n">0</span>) | 最强: <span id="fc-g-best" style="color:#d29922;font-weight:700">--</span>
+          📊 全局累积 全部 (n=<span id="fc-g-n">0</span>) | 最强: <span id="fc-g-best" style="color:#d29922;font-weight:700">--</span>
         </div>
         <table style="width:100%;border-collapse:collapse;font-size:11px" id="fc-g-table">
           <thead>
@@ -408,6 +427,47 @@
             </tr>
           </thead>
           <tbody id="fc-g-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <!-- 视图: 仅外生特征 (蒸馏用) -->
+    <div id="fc-view-exo" style="display:none;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+      <!-- 当前窗口 exo -->
+      <div style="flex:1;min-width:340px;background:var(--card);border:1px solid #1f6feb55;border-radius:8px;padding:10px 14px;max-height:320px;overflow-y:auto">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px">
+          🎯 当前窗口 <span style="background:#1f6feb22;color:#58a6ff;padding:1px 4px;border-radius:3px;font-size:9px">仅外生</span> (n=<span id="fc-ew-n">0</span>) | 最强: <span id="fc-ew-best" style="color:#d29922;font-weight:700">--</span>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:11px" id="fc-ew-table">
+          <thead>
+            <tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+              <th style="text-align:left;padding:2px 4px;width:24px">#</th>
+              <th style="text-align:left;padding:2px 4px">特征</th>
+              <th style="text-align:left;padding:2px 4px;width:40px">类别</th>
+              <th style="text-align:right;padding:2px 4px;width:60px">r</th>
+              <th style="text-align:left;padding:2px 4px;width:100px">|r|</th>
+              <th style="text-align:right;padding:2px 4px;width:45px">一致%</th>
+            </tr>
+          </thead>
+          <tbody id="fc-ew-body"></tbody>
+        </table>
+      </div>
+      <!-- 全局累积 exo -->
+      <div style="flex:1;min-width:340px;background:var(--card);border:1px solid #1f6feb55;border-radius:8px;padding:10px 14px;max-height:320px;overflow-y:auto">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px">
+          🎯 全局累积 <span style="background:#1f6feb22;color:#58a6ff;padding:1px 4px;border-radius:3px;font-size:9px">仅外生</span> (n=<span id="fc-eg-n">0</span>) | 最强: <span id="fc-eg-best" style="color:#d29922;font-weight:700">--</span>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:11px" id="fc-eg-table">
+          <thead>
+            <tr style="color:var(--muted);border-bottom:1px solid var(--border)">
+              <th style="text-align:left;padding:2px 4px;width:24px">#</th>
+              <th style="text-align:left;padding:2px 4px">特征</th>
+              <th style="text-align:left;padding:2px 4px;width:40px">类别</th>
+              <th style="text-align:right;padding:2px 4px;width:60px">r</th>
+              <th style="text-align:left;padding:2px 4px;width:100px">|r|</th>
+              <th style="text-align:right;padding:2px 4px;width:45px">一致%</th>
+            </tr>
+          </thead>
+          <tbody id="fc-eg-body"></tbody>
         </table>
       </div>
     </div>
@@ -945,7 +1005,7 @@ function updateUI(d) {
       if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:8px">样本不足 (n<3)</td></tr>';
       return;
     }
-    const catColors = { BTC: '#58a6ff', PM: '#d29922', '时序': '#bc8cff', '仓位': '#3fb950' };
+    const catColors = { BTC: '#58a6ff', PM: '#d29922', '时序': '#bc8cff', '仓位': '#3fb950', 'RTDS-PTB': '#f0883e' };
     let html = '';
     fcData.features.forEach(f => {
       const rColor = Math.abs(f.r) > 0.3 ? (f.r > 0 ? 'var(--green)' : 'var(--red)') :
@@ -954,9 +1014,13 @@ function updateUI(d) {
       const barColor = f.r > 0 ? 'var(--green)' : f.r < 0 ? 'var(--red)' : 'var(--muted)';
       const catColor = catColors[f.cat] || 'var(--muted)';
       const rankBg = f.rank === 1 ? 'rgba(210,153,34,0.15)' : 'transparent';
+      // 因果性标记: endo 标注为仓位/风控逻辑
+      const causalBadge = f.causality === 'endo'
+        ? ' <span style="font-size:8px;background:#da363355;color:#ffa198;padding:0 3px;border-radius:2px;vertical-align:middle" title="内生特征: 仓位/交易状态, 属于风控逻辑输入">内生</span>'
+        : '';
       html += `<tr style="border-bottom:1px solid rgba(48,54,61,0.5);background:${rankBg}">
         <td style="padding:3px 4px;color:var(--muted)">${f.rank}</td>
-        <td style="padding:3px 4px;font-weight:${f.rank <= 3 ? 700 : 400}">${f.name}</td>
+        <td style="padding:3px 4px;font-weight:${f.rank <= 3 ? 700 : 400}">${f.name}${causalBadge}</td>
         <td style="padding:3px 4px;font-size:9px;color:${catColor}">${f.cat}</td>
         <td style="padding:3px 4px;text-align:right;color:${rColor};font-weight:700;font-family:monospace">
           ${f.r >= 0 ? '+' : ''}${f.r.toFixed(4)}
@@ -973,6 +1037,8 @@ function updateUI(d) {
   }
   renderFeatureTable('fc-w', d.feature_corr_window);
   renderFeatureTable('fc-g', d.feature_corr_global);
+  renderFeatureTable('fc-ew', d.feature_corr_exo_window);
+  renderFeatureTable('fc-eg', d.feature_corr_exo_global);
 
   // ── 历史结算 ──
   const sPnl = d.settled_total_pnl || 0;
