@@ -1487,9 +1487,9 @@ async def chainlink_rtds_stream():
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(
                     PM_RTDS_WS,
-                    heartbeat=5.0,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    autoping=True,       # 自动回复服务器 ping
+                    heartbeat=None,      # 不用 aiohttp 内置心跳, 用我们自己的 _rtds_ping_loop
+                    timeout=aiohttp.ClientWSTimeout(ws_close=15),
+                    autoping=False,      # 手动处理 PING/PONG, 否则 PONG 被吞导致超时误判
                     autoclose=False,     # 手动控制关闭, 避免静默断连
                 ) as ws:
                     # 订阅 crypto_prices_chainlink (无 filters, 客户端过滤 btc/usd)
@@ -1571,6 +1571,9 @@ async def chainlink_rtds_stream():
                                         )
                             elif msg.type == aiohttp.WSMsgType.PONG:
                                 state.rtds_last_pong_ts = time.time()
+                            elif msg.type == aiohttp.WSMsgType.PING:
+                                # autoping=False → 手动回复服务器 PING
+                                await ws.pong(msg.data)
                             elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                                 print(
                                     f"[Chainlink RTDS] WS 收到 {msg.type.name}, "
