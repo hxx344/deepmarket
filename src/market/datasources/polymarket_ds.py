@@ -1,14 +1,15 @@
 """
 Polymarket DataSource - Polymarket 预测市场数据源
 
-通过 Gamma API 自动发现当前 5 分钟 BTC Up/Down 预测市场，
+通过 Gamma API 自动发现当前 5 分钟 BTC/ETH/XRP Up/Down 预测市场，
 通过 CLOB API 轮询 midpoint 价格，
 每 5 分钟自动轮换到下一个窗口市场。
 
 市场发现机制:
-  slug 模式: btc-updown-5m-{窗口开始时间的UTC Unix时间戳}
+  slug 模式: {coin}-updown-5m-{窗口开始时间的UTC Unix时间戳}
   API: GET https://gamma-api.polymarket.com/events?slug={slug}
   示例: btc-updown-5m-1771159500 → "Bitcoin Up or Down - February 15, 7:45AM-7:50AM ET"
+  支持: btc / eth / xrp
 """
 
 from __future__ import annotations
@@ -62,7 +63,13 @@ class PolymarketDataSource(DataSourceBase):
     CLOB_REST = "https://clob.polymarket.com"
     CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-    # 5-min 市场 slug 前缀
+    # 5-min 市场 slug 前缀 (按币种)
+    SLUG_PREFIXES: dict[str, str] = {
+        "btc": "btc-updown-5m-",
+        "eth": "eth-updown-5m-",
+        "xrp": "xrp-updown-5m-",
+    }
+    # Legacy 别名
     SLUG_PREFIX = "btc-updown-5m-"
 
     def __init__(
@@ -71,6 +78,7 @@ class PolymarketDataSource(DataSourceBase):
         market_ids: list[str] | None = None,
         search_query: str = "Bitcoin",
         poll_interval: float = 5.0,
+        symbols: list[str] | None = None,
     ) -> None:
         super().__init__(event_bus)
         self.market_ids = market_ids or []
@@ -81,10 +89,17 @@ class PolymarketDataSource(DataSourceBase):
         self._session: aiohttp.ClientSession | None = None
         self._running = False
 
-        # 当前活跃的 5-min 窗口市场
-        self._active_market: PMMarket | None = None
-        # 当前窗口的 UTC unix 时间戳
-        self._current_window_ts: int = 0
+        # 支持的币种列表
+        self._symbols: list[str] = symbols or ["btc"]
+
+        # 每个币种的活跃 5-min 窗口市场
+        self._active_markets: dict[str, PMMarket | None] = {
+            s: None for s in self._symbols
+        }
+        # 每个币种当前窗口的 UTC unix 时间戳
+        self._current_window_tses: dict[str, int] = {
+            s: 0 for s in self._symbols
+        }
 
         # WS Book 频道回调: token_id → callable(bids, asks, is_snapshot)
         # 由 main.py 注入, 用于将 WS 实时 OB 数据直接推送到 OrderBook 对象
@@ -94,30 +109,58 @@ class PolymarketDataSource(DataSourceBase):
         # 当前 WS Book 已订阅的 token IDs (用于窗口切换时取消旧订阅)
         self._ws_book_subscribed_ids: list[str] = []
 
+    # ── Legacy 属性 (向后兼容, BTC) ──
+    @property
+    def _active_market(self) -> PMMarket | None:
+        return self._active_markets.get("btc")
+
+    @_active_market.setter
+    def _active_market(self, value: PMMarket | None) -> None:
+        self._active_markets["btc"] = value
+
+    @property
+    def _current_window_ts(self) -> int:
+        return self._current_window_tses.get("btc", 0)
+
+    @_current_window_ts.setter
+    def _current_window_ts(self, value: int) -> None:
+        self._current_window_tses["btc"] = value
+
     def name(self) -> str:
         return "polymarket"
+
+    def _token_to_symbol(self, token_id: str) -> str | None:
+        """根据 token_id 查找所属的币种 (btc/eth/xrp)"""
+        for sym in self._symbols:
+            mkt = self._active_markets.get(sym)
+            if mkt and token_id in mkt.token_ids:
+                return sym
+        return None
 
     # ────────────────── 连接管理 ──────────────────
 
     async def connect(self) -> None:
-        """连接并发现当前 5-min BTC 窗口市场"""
+        """连接并发现当前 5-min 窗口市场 (所有币种)"""
         self.status = DataSourceStatus.CONNECTING
         try:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15),
             )
 
-            # 发现当前 5-min 窗口
-            await self._discover_current_window()
+            # 为所有币种发现当前 5-min 窗口
+            for symbol in self._symbols:
+                await self._discover_current_window(symbol)
 
-            if self._active_market:
+            found = [s for s in self._symbols if self._active_markets.get(s)]
+            if found:
                 self.status = DataSourceStatus.CONNECTED
                 self._reconnect_count = 0
                 logger.info(
-                    f"Polymarket 已连接 — 当前窗口: {self._active_market.question}"
+                    f"Polymarket 已连接 — 活跃币种: {found}"
                 )
             else:
                 self.status = DataSourceStatus.CONNECTED
+                logger.warning("Polymarket 已连接, 但未找到任何 5-min 窗口市场")
                 logger.warning("Polymarket 已连接, 但未找到当前 5-min 窗口市场")
         except Exception as e:
             self.status = DataSourceStatus.ERROR
@@ -162,12 +205,19 @@ class PolymarketDataSource(DataSourceBase):
         # 价格轮询任务 (核心)
         tasks.append(asyncio.create_task(self._price_poll_loop()))
 
+        # 收集所有币种的 token_ids
+        all_token_ids: list[str] = []
+        for sym in self._symbols:
+            mkt = self._active_markets.get(sym)
+            if mkt and mkt.token_ids:
+                all_token_ids.extend(mkt.token_ids[:2])
+
         # WS 成交流 (可选, 需要 token_ids)
-        if self._active_market and self._active_market.token_ids:
+        if all_token_ids:
             tasks.append(asyncio.create_task(self._ws_stream_loop()))
 
         # WS Book 实时订单簿频道 (替代 REST 轮询 OB)
-        if self._active_market and self._active_market.token_ids:
+        if all_token_ids:
             tasks.append(asyncio.create_task(self._ws_book_loop()))
 
         # 5-min 窗口自动轮换
@@ -202,11 +252,11 @@ class PolymarketDataSource(DataSourceBase):
         seconds_left = (window_end - now_utc).total_seconds()
         return ts_start, ts_end, max(seconds_left, 0)
 
-    async def _discover_current_window(self) -> None:
+    async def _discover_current_window(self, symbol: str = "btc") -> None:
         """
-        通过 slug 模式精确定位当前 5-min BTC Up/Down 市场。
+        通过 slug 模式精确定位当前 5-min Up/Down 市场。
 
-        Slug 模式: btc-updown-5m-{窗口开始 UTC Unix 秒}
+        Slug 模式: {coin}-updown-5m-{窗口开始 UTC Unix 秒}
         API: GET /events?slug={slug} → 返回事件及嵌套市场
         """
         if not self._session:
@@ -215,10 +265,14 @@ class PolymarketDataSource(DataSourceBase):
         ts_start, ts_end, secs_left = self._calc_window_ts()
 
         # 如果已经在当前窗口，跳过
-        if ts_start == self._current_window_ts and self._active_market:
+        if (
+            ts_start == self._current_window_tses.get(symbol, 0)
+            and self._active_markets.get(symbol)
+        ):
             return
 
-        slug = f"{self.SLUG_PREFIX}{ts_start}"
+        prefix = self.SLUG_PREFIXES.get(symbol, f"{symbol}-updown-5m-")
+        slug = f"{prefix}{ts_start}"
         try:
             url = f"{self.GAMMA_API}/events"
             async with self._session.get(url, params={"slug": slug}) as resp:
@@ -261,11 +315,12 @@ class PolymarketDataSource(DataSourceBase):
             # 解析市场数据
             pm = self._parse_gamma_market(target_market, ts_start, ts_end)
             if pm:
-                old_q = self._active_market.question if self._active_market else "无"
-                self._active_market = pm
-                self._current_window_ts = ts_start
+                old_mkt = self._active_markets.get(symbol)
+                old_q = old_mkt.question if old_mkt else "无"
+                self._active_markets[symbol] = pm
+                self._current_window_tses[symbol] = ts_start
                 logger.info(
-                    f"5-min 窗口切换: {old_q} → {pm.question} "
+                    f"[{symbol.upper()}] 5-min 窗口切换: {old_q} → {pm.question} "
                     f"(Up={pm.prices[0]:.3f}, Down={pm.prices[1] if len(pm.prices) > 1 else 0:.3f}, "
                     f"剩余 {secs_left:.0f}s)"
                 )
@@ -320,7 +375,7 @@ class PolymarketDataSource(DataSourceBase):
 
     async def _window_rotation_loop(self) -> None:
         """
-        5-min 窗口自动轮换。
+        5-min 窗口自动轮换 (所有币种)。
 
         在每个 5 分钟边界 + 2s 时切换到新窗口市场，
         并立即发起一次价格轮询。
@@ -333,14 +388,18 @@ class PolymarketDataSource(DataSourceBase):
                 logger.debug(f"PM 窗口轮换: {wait:.1f}s 后切换")
                 await asyncio.sleep(wait)
 
-                # 发现新窗口
-                await self._discover_current_window()
+                # 为每个币种发现新窗口
+                for symbol in self._symbols:
+                    await self._discover_current_window(symbol)
 
-                # 立即轮询新窗口价格
-                if self._active_market:
-                    await self._poll_midpoints()
-                    # WS Book 重新订阅新窗口 token
-                    await self._resubscribe_book()
+                # 立即轮询所有币种新窗口价格
+                for symbol in self._symbols:
+                    mkt = self._active_markets.get(symbol)
+                    if mkt:
+                        await self._poll_midpoints(symbol)
+
+                # WS Book 重新订阅新窗口 token
+                await self._resubscribe_book()
 
             except asyncio.CancelledError:
                 break
@@ -352,14 +411,15 @@ class PolymarketDataSource(DataSourceBase):
 
     async def _price_poll_loop(self) -> None:
         """
-        定期轮询 CLOB midpoint 获取 YES/NO 价格。
-
-        这是获取 PM 市场价格的主要方式。
+        定期轮询 CLOB midpoint 获取 YES/NO 价格 (所有币种)。
         """
         while self._running:
             try:
-                if self._active_market and self._session:
-                    await self._poll_midpoints()
+                if self._session:
+                    for symbol in self._symbols:
+                        mkt = self._active_markets.get(symbol)
+                        if mkt:
+                            await self._poll_midpoints(symbol)
                 await asyncio.sleep(self.poll_interval)
             except asyncio.CancelledError:
                 break
@@ -391,9 +451,9 @@ class PolymarketDataSource(DataSourceBase):
             logger.debug(f"{side} price 获取失败 [{token_id[:12]}]: {e}")
         return 0.0
 
-    async def _poll_midpoints(self) -> None:
-        """获取活跃市场的 YES/NO midpoint + bid/ask 价格并发布事件 (并发请求)"""
-        mkt = self._active_market
+    async def _poll_midpoints(self, symbol: str = "btc") -> None:
+        """获取指定币种市场的 YES/NO midpoint + bid/ask 价格并发布事件 (并发请求)"""
+        mkt = self._active_markets.get(symbol)
         if not mkt or not mkt.token_ids or not self._session:
             return
 
@@ -450,6 +510,7 @@ class PolymarketDataSource(DataSourceBase):
             await self.event_bus.publish(Event(
                 type=EventType.PM_PRICE,
                 data={
+                    "symbol": symbol,
                     "yes_price": yes_price,
                     "no_price": no_price,
                     "yes_bid": yes_bid,
@@ -497,7 +558,13 @@ class PolymarketDataSource(DataSourceBase):
             timeout_task = None
             try:
                 mkt = self._active_market
-                if not mkt or not mkt.token_ids or not self._session:
+                # 收集所有币种的 token_ids
+                all_token_ids: list[str] = []
+                for sym in self._symbols:
+                    m = self._active_markets.get(sym)
+                    if m and m.token_ids:
+                        all_token_ids.extend(m.token_ids[:2])
+                if not all_token_ids or not self._session:
                     await asyncio.sleep(5)
                     continue
 
@@ -509,7 +576,7 @@ class PolymarketDataSource(DataSourceBase):
 
                 # 订阅 market 频道 (Polymarket 官方格式)
                 # 一次订阅所有 token, 并启用 custom_feature_enabled 获取 best_bid_ask 事件
-                subscribe_ids = mkt.token_ids[:2]
+                subscribe_ids = all_token_ids
                 await self._ws_book.send_json({
                     "type": "market",
                     "assets_ids": subscribe_ids,
@@ -668,13 +735,17 @@ class PolymarketDataSource(DataSourceBase):
                 )
 
     async def _resubscribe_book(self) -> None:
-        """窗口轮换后重新订阅新 token 的 book 频道 (Polymarket 动态订阅格式)。"""
+        """窗口轮换后重新订阅所有币种 token 的 book 频道 (Polymarket 动态订阅格式)。"""
         if not self._ws_book or self._ws_book.closed:
             return
-        mkt = self._active_market
-        if not mkt or not mkt.token_ids:
+        # 收集所有币种的 token_ids
+        new_ids: list[str] = []
+        for sym in self._symbols:
+            mkt = self._active_markets.get(sym)
+            if mkt and mkt.token_ids:
+                new_ids.extend(mkt.token_ids[:2])
+        if not new_ids:
             return
-        new_ids = mkt.token_ids[:2]
         old_ids = getattr(self, '_ws_book_subscribed_ids', [])
 
         try:

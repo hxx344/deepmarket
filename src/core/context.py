@@ -43,9 +43,12 @@ class AccountState:
 
 @dataclass
 class MarketState:
-    """市场状态快照"""
-    btc_price: float = 0.0
-    btc_price_updated_at: float = 0.0  # BTC 价格最后一次真正变化的时间戳
+    """市场状态快照 (支持多币种: btc/eth/xrp)"""
+    symbol: str = ""                        # 币种标识: "btc" / "eth" / "xrp"
+    price: float = 0.0                      # 通用币种价格 (Chainlink)
+    price_updated_at: float = 0.0           # 价格最后一次真正变化的时间戳
+    btc_price: float = 0.0                  # Legacy: BTC 专用别名
+    btc_price_updated_at: float = 0.0       # Legacy: BTC 专用别名
     pm_yes_price: float = 0.0
     pm_no_price: float = 0.0
     pm_yes_bid: float = 0.0
@@ -62,8 +65,8 @@ class MarketState:
     pm_neg_risk: bool = False               # 是否负风险市场 (BTC 5-min 通常是 False)
     pm_window_seconds_left: float = 0.0  # 当前 5-min 窗口剩余秒数
     pm_window_start_ts: int = 0            # 当前窗口开始 UTC unix ts
-    pm_window_start_price: float = 0.0     # 窗口开始时 BTC 基准价格 (Price to Beat)
-    binance_price: float = 0.0             # Binance BTC/USDT 实时价格 (领先指标)
+    pm_window_start_price: float = 0.0     # 窗口开始时基准价格 (Price to Beat)
+    binance_price: float = 0.0             # Binance 实时价格 (领先指标)
     binance_price_ts: float = 0.0          # Binance 价格最后更新时间戳
     last_update: float = 0.0
 
@@ -86,7 +89,14 @@ class Context:
         self.event_bus = event_bus or get_event_bus()
 
         self.account = AccountState()
-        self.market = MarketState()
+        self.market = MarketState(symbol="btc")
+
+        # 多币种市场状态 (btc / eth / xrp)
+        self.markets: dict[str, MarketState] = {
+            "btc": self.market,  # BTC 共享 self.market 保持向后兼容
+            "eth": MarketState(symbol="eth"),
+            "xrp": MarketState(symbol="xrp"),
+        }
 
         # 自定义数据存储（策略可用）
         self._data: dict[str, Any] = {}
@@ -125,6 +135,14 @@ class Context:
 
     def snapshot(self) -> dict[str, Any]:
         """导出当前上下文快照"""
+        markets_snap = {}
+        for sym, mkt in self.markets.items():
+            markets_snap[sym] = {
+                "price": mkt.price,
+                "pm_yes_ask": mkt.pm_yes_ask,
+                "pm_no_ask": mkt.pm_no_ask,
+                "pm_window_seconds_left": mkt.pm_window_seconds_left,
+            }
         return {
             "run_mode": self.run_mode.value,
             "trading_mode": self.trading_mode.value,
@@ -143,5 +161,6 @@ class Context:
                 "pm_no_bid": self.market.pm_no_bid,
                 "pm_no_ask": self.market.pm_no_ask,
             },
+            "markets": markets_snap,
             "timestamp": self.now(),
         }

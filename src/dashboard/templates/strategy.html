@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}策略中心{% endblock %}
-{% block page_title %}策略中心 — Tail Reversal{% endblock %}
+{% block page_title %}策略中心 — Tail Reversal v2 (Multi-Symbol){% endblock %}
 
 {% block head %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -9,15 +9,12 @@
 {% block content %}
 <div class="space-y-5" x-data="strategyPage()" x-init="init()">
 
-  <!-- ═══ 1. 窗口状态 & 入场条件 ═══ -->
+  <!-- ═══ 0. 币种切换 & 汇总统计 ═══ -->
   <div class="card">
-    <div class="flex items-center justify-between mb-4">
+    <div class="flex items-center justify-between mb-3">
       <div class="flex items-center gap-3">
         <h3 class="text-sm font-semibold text-gray-300">Tail Reversal</h3>
-        <span class="badge badge-blue text-[10px]">v<span x-text="stratVersion">1.0</span></span>
-        <span class="badge text-[10px]"
-              :class="{'badge-green': entryZone === 'READY', 'badge-yellow': entryZone === 'SCAN', 'badge-red': entryZone === 'FULL'}"
-              x-text="entryZone">SCAN</span>
+        <span class="badge badge-blue text-[10px]">v<span x-text="stratVersion">2.0</span></span>
       </div>
       <div class="flex items-center gap-3 text-xs">
         <span class="text-gray-400">模式</span>
@@ -27,34 +24,89 @@
       </div>
     </div>
 
-    <!-- 核心指标 -->
+    <!-- 币种 Tab -->
+    <div class="flex items-center gap-2 mb-3">
+      <template x-for="sym in symbolList" :key="sym">
+        <button
+          @click="activeSymbol = sym"
+          class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all"
+          :class="activeSymbol === sym
+            ? 'bg-brand-600 text-white shadow-lg shadow-brand-600/30'
+            : 'bg-surface-3 text-gray-400 hover:bg-surface-3/80 hover:text-gray-200'"
+          x-text="sym.toUpperCase()"></button>
+      </template>
+    </div>
+
+    <!-- 汇总条 -->
+    <div class="grid grid-cols-5 gap-2 text-center text-xs">
+      <div class="bg-surface-3 rounded-lg p-2">
+        <p class="text-gray-500">总交易</p>
+        <p class="font-mono text-white font-bold" x-text="agg.trade_count">0</p>
+      </div>
+      <div class="bg-surface-3 rounded-lg p-2">
+        <p class="text-gray-500">总胜/负</p>
+        <p class="font-mono">
+          <span class="text-up" x-text="agg.win_count">0</span>
+          <span class="text-gray-600">/</span>
+          <span class="text-down" x-text="agg.loss_count">0</span>
+        </p>
+      </div>
+      <div class="bg-surface-3 rounded-lg p-2">
+        <p class="text-gray-500">总胜率</p>
+        <p class="font-mono text-brand-400" x-text="agg.win_rate.toFixed(1) + '%'">0%</p>
+      </div>
+      <div class="bg-surface-3 rounded-lg p-2">
+        <p class="text-gray-500">总PnL</p>
+        <p class="font-mono" :class="agg.cumulative_pnl >= 0 ? 'text-up' : 'text-down'"
+           x-text="(agg.cumulative_pnl >= 0 ? '+$' : '-$') + Math.abs(agg.cumulative_pnl).toFixed(2)">$0</p>
+      </div>
+      <div class="bg-surface-3 rounded-lg p-2">
+        <p class="text-gray-500">余额</p>
+        <p class="font-mono text-white" x-text="'$' + account.balance.toFixed(2)">$0</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 1. 窗口状态 & 入场条件 (当前币种) ═══ -->
+  <div class="card">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <h3 class="text-sm font-semibold text-gray-300">
+          <span x-text="activeSymbol.toUpperCase()">BTC</span> 窗口状态
+        </h3>
+        <span class="badge text-[10px]"
+              :class="{'badge-green': cur.entry_zone === 'READY', 'badge-yellow': cur.entry_zone === 'SCAN', 'badge-red': cur.entry_zone === 'FULL'}"
+              x-text="cur.entry_zone">SCAN</span>
+      </div>
+    </div>
+
     <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-4">
       <div class="bg-surface-3 rounded-lg p-3 text-center">
-        <p class="stat-label">RTDS (Chainlink)</p>
-        <p class="stat-value text-white !text-lg font-mono" x-text="'$' + rtdsPrice.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</p>
+        <p class="stat-label">RTDS 价格</p>
+        <p class="stat-value text-white !text-lg font-mono" x-text="'$' + cur.rtds_price.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
         <p class="stat-label">PTB (基准价)</p>
-        <p class="stat-value text-yellow-400 !text-lg font-mono" x-text="'$' + windowPtb.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</p>
+        <p class="stat-value text-yellow-400 !text-lg font-mono" x-text="'$' + cur.window_ptb.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
         <p class="stat-label">偏离 PTB</p>
         <p class="stat-value !text-lg font-mono"
-           :class="deviation >= 0 ? 'text-up' : 'text-down'"
-           x-text="(deviation >= 0 ? '+' : '') + '$' + Math.abs(deviation).toFixed(2)">$0.00</p>
+           :class="cur.deviation >= 0 ? 'text-up' : 'text-down'"
+           x-text="(cur.deviation >= 0 ? '+' : '') + '$' + Math.abs(cur.deviation).toFixed(2)">$0.00</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
         <p class="stat-label">便宜侧</p>
         <p class="stat-value !text-lg font-bold"
-           :class="cheapSide === 'UP' ? 'text-up' : 'text-down'"
-           x-text="cheapSide + ' @' + cheapAsk.toFixed(2)">—</p>
+           :class="cur.cheap_side === 'UP' ? 'text-up' : 'text-down'"
+           x-text="cur.cheap_side + ' @' + cur.cheap_ask.toFixed(2)">—</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
         <p class="stat-label">已买方向</p>
         <p class="stat-value !text-lg font-mono">
-          <span :class="boughtSides.includes('UP') ? 'text-up font-bold' : 'text-gray-600'" x-text="'UP'"></span>
+          <span :class="cur.bought_sides.includes('UP') ? 'text-up font-bold' : 'text-gray-600'">UP</span>
           <span class="text-gray-600 mx-1">/</span>
-          <span :class="boughtSides.includes('DOWN') ? 'text-down font-bold' : 'text-gray-600'" x-text="'DN'"></span>
+          <span :class="cur.bought_sides.includes('DOWN') ? 'text-down font-bold' : 'text-gray-600'">DN</span>
         </p>
       </div>
     </div>
@@ -63,17 +115,16 @@
     <div class="mb-2">
       <div class="flex items-center justify-between text-xs text-gray-400 mb-1">
         <span>窗口进度</span>
-        <span class="font-mono text-white" x-text="elapsedPct.toFixed(1) + '% — ' + formatCountdown(secsLeft) + ' left'"></span>
+        <span class="font-mono text-white" x-text="cur.elapsed_pct.toFixed(1) + '% — ' + formatCountdown(cur.secs_left) + ' left'"></span>
       </div>
       <div class="relative h-4 bg-surface-3 rounded-full overflow-hidden">
-        <!-- 进度 -->
         <div class="absolute top-0 h-full transition-all duration-500 rounded-full z-10"
-             :class="entryZone === 'READY' ? 'bg-green-500/80' : entryZone === 'FULL' ? 'bg-yellow-500/60' : 'bg-brand-600/60'"
-             :style="'width:' + elapsedPct + '%'"></div>
+             :class="cur.entry_zone === 'READY' ? 'bg-green-500/80' : cur.entry_zone === 'FULL' ? 'bg-yellow-500/60' : 'bg-brand-600/60'"
+             :style="'width:' + cur.elapsed_pct + '%'"></div>
       </div>
       <div class="flex justify-between text-[10px] text-gray-500 mt-0.5">
         <span>0%</span>
-        <span class="text-brand-400">全窗口扫描 ask=<span x-text="targetAsk"></span></span>
+        <span class="text-brand-400">全窗口扫描 ask=<span x-text="cur.target_ask"></span></span>
         <span>100%</span>
       </div>
     </div>
@@ -82,87 +133,92 @@
     <div class="grid grid-cols-2 gap-3 mt-3">
       <div class="flex items-center justify-between bg-surface-3 rounded-lg px-3 py-2">
         <span class="text-xs text-gray-400">UP Ask</span>
-        <span class="font-mono text-sm" :class="upAsk <= 0.01 ? 'text-green-400 font-bold' : 'text-gray-200'"
-              x-text="'¢' + (upAsk * 100).toFixed(1)">¢0.0</span>
+        <span class="font-mono text-sm" :class="cur.up_ask <= 0.01 ? 'text-green-400 font-bold' : 'text-gray-200'"
+              x-text="'¢' + (cur.up_ask * 100).toFixed(1)">¢0.0</span>
       </div>
       <div class="flex items-center justify-between bg-surface-3 rounded-lg px-3 py-2">
         <span class="text-xs text-gray-400">DOWN Ask</span>
-        <span class="font-mono text-sm" :class="dnAsk <= 0.01 ? 'text-green-400 font-bold' : 'text-gray-200'"
-              x-text="'¢' + (dnAsk * 100).toFixed(1)">¢0.0</span>
+        <span class="font-mono text-sm" :class="cur.dn_ask <= 0.01 ? 'text-green-400 font-bold' : 'text-gray-200'"
+              x-text="'¢' + (cur.dn_ask * 100).toFixed(1)">¢0.0</span>
       </div>
     </div>
   </div>
 
-  <!-- ═══ 2. BTC Tick 图 ═══ -->
+  <!-- ═══ 2. Tick 图 ═══ -->
   <div class="card">
     <div class="flex items-center justify-between mb-4">
-      <h3 class="text-sm font-semibold text-gray-300">BTC 行情 (<span class="text-[#58a6ff]">CHAINLINK</span>)</h3>
-      <span class="font-mono text-white text-lg font-bold" x-text="'$' + rtdsPrice.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</span>
+      <h3 class="text-sm font-semibold text-gray-300">
+        <span x-text="activeSymbol.toUpperCase()">BTC</span> 行情
+        (<span class="text-[#58a6ff]">CHAINLINK</span>)
+      </h3>
+      <span class="font-mono text-white text-lg font-bold"
+            x-text="'$' + cur.rtds_price.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</span>
     </div>
     <div style="position:relative; height:260px;">
       <canvas id="chart-btc" style="width:100% !important; height:100% !important;"></canvas>
     </div>
   </div>
 
-  <!-- ═══ 3. 当前窗口下注 & 绩效 ═══ -->
+  <!-- ═══ 3. 当前窗口下注 & 绩效 (当前币种) ═══ -->
   <div class="grid grid-cols-2 gap-5">
-    <!-- 下注状态 -->
     <div class="card">
-      <h3 class="text-sm font-semibold text-gray-300 mb-3">当前窗口</h3>
+      <h3 class="text-sm font-semibold text-gray-300 mb-3">
+        <span x-text="activeSymbol.toUpperCase()">BTC</span> 当前窗口
+      </h3>
       <div class="grid grid-cols-2 gap-3 text-center">
         <div class="bg-surface-3 rounded-lg p-3">
           <p class="stat-label">下注次数</p>
           <p class="stat-value text-brand-500 !text-xl">
-            <span x-text="betsThisWindow">0</span>
-            <span class="text-gray-500 text-sm">/ <span x-text="maxBetsPerWindow">3</span></span>
+            <span x-text="cur.bets_this_window">0</span>
+            <span class="text-gray-500 text-sm">/ <span x-text="cur.max_bets_per_window">2</span></span>
           </p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
           <p class="stat-label">窗口投入</p>
-          <p class="stat-value font-mono !text-xl" :class="costThisWindow > 0 ? 'text-yellow-400' : 'text-gray-500'">
-            $<span x-text="costThisWindow.toFixed(2)">0.00</span>
-            <span class="text-gray-500 text-sm">/ $<span x-text="maxCostPerWindow">20</span></span>
+          <p class="stat-value font-mono !text-xl" :class="cur.cost_this_window > 0 ? 'text-yellow-400' : 'text-gray-500'">
+            $<span x-text="cur.cost_this_window.toFixed(2)">0.00</span>
+            <span class="text-gray-500 text-sm">/ $<span x-text="cur.max_cost_per_window">20</span></span>
           </p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
           <p class="stat-label">UP Shares</p>
-          <p class="stat-value text-up !text-xl font-mono" x-text="cumUpShares.toFixed(1)">0.0</p>
+          <p class="stat-value text-up !text-xl font-mono" x-text="cur.cum_up_shares.toFixed(1)">0.0</p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
           <p class="stat-label">DN Shares</p>
-          <p class="stat-value text-down !text-xl font-mono" x-text="cumDnShares.toFixed(1)">0.0</p>
+          <p class="stat-value text-down !text-xl font-mono" x-text="cur.cum_dn_shares.toFixed(1)">0.0</p>
         </div>
       </div>
     </div>
 
-    <!-- 绩效 -->
     <div class="card">
-      <h3 class="text-sm font-semibold text-gray-300 mb-3">累计绩效</h3>
+      <h3 class="text-sm font-semibold text-gray-300 mb-3">
+        <span x-text="activeSymbol.toUpperCase()">BTC</span> 累计绩效
+      </h3>
       <div class="grid grid-cols-2 gap-3 text-center">
         <div class="bg-surface-3 rounded-lg p-3">
           <p class="stat-label">累计 PnL</p>
           <p class="stat-value !text-xl font-mono"
-             :class="cumulativePnl >= 0 ? 'text-up' : 'text-down'"
-             x-text="(cumulativePnl >= 0 ? '+$' : '-$') + Math.abs(cumulativePnl).toFixed(2)">$0.00</p>
+             :class="cur.cumulative_pnl >= 0 ? 'text-up' : 'text-down'"
+             x-text="(cur.cumulative_pnl >= 0 ? '+$' : '-$') + Math.abs(cur.cumulative_pnl).toFixed(2)">$0.00</p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
           <p class="stat-label">胜率</p>
-          <p class="stat-value !text-xl font-mono text-brand-500" x-text="winRate.toFixed(1) + '%'">0.0%</p>
+          <p class="stat-value !text-xl font-mono text-brand-500" x-text="cur.win_rate.toFixed(1) + '%'">0.0%</p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
           <p class="stat-label">胜/负</p>
           <p class="stat-value !text-xl font-mono">
-            <span class="text-up" x-text="winCount">0</span>
+            <span class="text-up" x-text="cur.win_count">0</span>
             <span class="text-gray-500">/</span>
-            <span class="text-down" x-text="lossCount">0</span>
+            <span class="text-down" x-text="cur.loss_count">0</span>
           </p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
           <p class="stat-label">总下注</p>
-          <p class="stat-value !text-xl font-mono text-white" x-text="tradeCount">0</p>
+          <p class="stat-value !text-xl font-mono text-white" x-text="cur.trade_count">0</p>
         </div>
       </div>
-      <!-- 账户余额 -->
       <div class="mt-3 flex justify-between bg-surface-3 rounded-lg px-3 py-2 text-xs">
         <span class="text-gray-400">余额</span>
         <span class="font-mono text-white" x-text="'$' + account.balance.toFixed(2)">$0.00</span>
@@ -176,7 +232,9 @@
   <!-- ═══ 4. 历史结算 ═══ -->
   <div class="card">
     <div class="flex items-center justify-between mb-3">
-      <h3 class="text-sm font-semibold text-gray-300">历史结算</h3>
+      <h3 class="text-sm font-semibold text-gray-300">
+        <span x-text="activeSymbol.toUpperCase()">BTC</span> 历史结算
+      </h3>
       <span class="text-xs text-gray-500" x-text="'共 ' + settlementHistory.length + ' 个窗口'"></span>
     </div>
     <div class="overflow-x-auto max-h-60 overflow-y-auto">
@@ -184,23 +242,23 @@
         <thead class="sticky top-0 bg-surface-2 z-10">
           <tr class="text-gray-400 border-b border-gray-700/50">
             <th class="py-1.5 px-2 text-left">时间</th>
+            <th class="py-1.5 px-2 text-center">币种</th>
             <th class="py-1.5 px-2 text-center">结果</th>
             <th class="py-1.5 px-2 text-center">赢家</th>
             <th class="py-1.5 px-2 text-right">投入</th>
             <th class="py-1.5 px-2 text-right">回收</th>
             <th class="py-1.5 px-2 text-right">PnL</th>
             <th class="py-1.5 px-2 text-right">偏离avg</th>
-            <th class="py-1.5 px-2 text-right">BTC</th>
-            <th class="py-1.5 px-2 text-right">PTB</th>
           </tr>
         </thead>
         <tbody>
           <template x-if="settlementHistory.length === 0">
-            <tr><td colspan="9" class="text-center text-gray-500 py-6">暂无结算记录</td></tr>
+            <tr><td colspan="8" class="text-center text-gray-500 py-6">暂无结算记录</td></tr>
           </template>
           <template x-for="(s, i) in settlementHistory.slice().reverse()" :key="i">
             <tr class="border-b border-gray-700/20 hover:bg-surface-3/50 transition-colors">
               <td class="py-1.5 px-2 font-mono text-gray-300" x-text="s.time || '-'"></td>
+              <td class="py-1.5 px-2 text-center font-bold text-brand-400" x-text="s.symbol || 'BTC'"></td>
               <td class="py-1.5 px-2 text-center">
                 <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold"
                       :class="s.result === 'WIN' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'"
@@ -215,8 +273,6 @@
                   :class="(s.pnl||0) >= 0 ? 'text-up' : 'text-down'"
                   x-text="((s.pnl||0) >= 0 ? '+' : '') + '$' + Math.abs(s.pnl||0).toFixed(2)"></td>
               <td class="py-1.5 px-2 text-right font-mono text-gray-400" x-text="'$' + (s.deviation_avg||0).toFixed(2)"></td>
-              <td class="py-1.5 px-2 text-right font-mono text-gray-400" x-text="'$' + (s.btc||0).toLocaleString()"></td>
-              <td class="py-1.5 px-2 text-right font-mono text-gray-400" x-text="'$' + (s.ptb||0).toLocaleString()"></td>
             </tr>
           </template>
         </tbody>
@@ -227,7 +283,9 @@
   <!-- ═══ 5. 入场明细 ═══ -->
   <div class="card">
     <div class="flex items-center justify-between mb-3">
-      <h3 class="text-sm font-semibold text-gray-300">入场明细</h3>
+      <h3 class="text-sm font-semibold text-gray-300">
+        <span x-text="activeSymbol.toUpperCase()">BTC</span> 入场明细
+      </h3>
       <span class="text-xs text-gray-500" x-text="'共 ' + entryHistory.length + ' 笔'"></span>
     </div>
     <div class="overflow-x-auto max-h-72 overflow-y-auto">
@@ -235,14 +293,14 @@
         <thead class="sticky top-0 bg-surface-2 z-10">
           <tr class="text-gray-400 border-b border-gray-700/50">
             <th class="py-1.5 px-2 text-left">时间</th>
+            <th class="py-1.5 px-2 text-center">币种</th>
             <th class="py-1.5 px-2 text-center">方向</th>
             <th class="py-1.5 px-2 text-right">价格</th>
             <th class="py-1.5 px-2 text-right">Shares</th>
             <th class="py-1.5 px-2 text-right">成本</th>
             <th class="py-1.5 px-2 text-right">赔率</th>
-            <th class="py-1.5 px-2 text-right">RTDS偏离</th>
+            <th class="py-1.5 px-2 text-right">偏离</th>
             <th class="py-1.5 px-2 text-right">进度</th>
-            <th class="py-1.5 px-2 text-right">余额</th>
           </tr>
         </thead>
         <tbody>
@@ -252,6 +310,7 @@
           <template x-for="(t, i) in entryHistory.slice().reverse()" :key="i">
             <tr class="border-b border-gray-700/20 hover:bg-surface-3/50 transition-colors">
               <td class="py-1.5 px-2 font-mono text-gray-300" x-text="t.time || '-'"></td>
+              <td class="py-1.5 px-2 text-center font-bold text-brand-400" x-text="t.symbol || 'BTC'"></td>
               <td class="py-1.5 px-2 text-center font-bold"
                   :class="t.side === 'UP' ? 'text-up' : 'text-down'"
                   x-text="t.side === 'UP' ? '▲ UP' : '▼ DN'"></td>
@@ -268,8 +327,6 @@
                   x-text="(t.deviation || 0) >= 0 ? '+$' + Math.abs(t.deviation||0).toFixed(2) : '-$' + Math.abs(t.deviation||0).toFixed(2)"></td>
               <td class="py-1.5 px-2 text-right font-mono text-gray-400"
                   x-text="(t.elapsed_pct || 0).toFixed(0) + '%'"></td>
-              <td class="py-1.5 px-2 text-right font-mono text-gray-400"
-                  x-text="t.balance_after !== undefined ? '$' + t.balance_after.toFixed(2) : '-'"></td>
             </tr>
           </template>
         </tbody>
@@ -284,7 +341,8 @@
       <template x-for="[k, v] in paramEntries" :key="k">
         <div class="flex justify-between py-1 border-b border-gray-700/30">
           <span class="text-gray-400" x-text="k"></span>
-          <span class="font-mono text-gray-200" x-text="typeof v === 'number' ? (v < 1 ? v.toFixed(4) : v.toFixed(2)) : String(v)"></span>
+          <span class="font-mono text-gray-200"
+                x-text="Array.isArray(v) ? v.join(', ') : (typeof v === 'number' ? (v < 1 ? v.toFixed(4) : v.toFixed(2)) : String(v))"></span>
         </div>
       </template>
     </div>
@@ -295,59 +353,69 @@
 {% block scripts %}
 <script>
 function strategyPage() {
+  const _emptySymbol = {
+    symbol: '', rtds_price: 0, window_ptb: 0, deviation: 0, abs_deviation: 0,
+    up_ask: 0, dn_ask: 0, cheap_side: '—', cheap_ask: 0,
+    elapsed_pct: 0, secs_left: 0, entry_zone: 'SCAN', target_ask: 0.01,
+    bought_sides: [],
+    bets_this_window: 0, max_bets_per_window: 2,
+    cost_this_window: 0, max_cost_per_window: 20,
+    cum_up_shares: 0, cum_dn_shares: 0, cum_up_cost: 0, cum_dn_cost: 0,
+    positions: [], has_position: false,
+    trade_count: 0, win_count: 0, loss_count: 0,
+    cumulative_pnl: 0, win_rate: 0, vol_30s: 0,
+    trade_history: [],
+  };
+
   return {
-    // ── 市场 ──
-    rtdsPrice: 0,
-    windowPtb: 0,
-    deviation: 0,
-    cheapSide: '—',
-    cheapAsk: 0,
-    upAsk: 0,
-    dnAsk: 0,
-    btcVol30s: 0,
-    stratVersion: '1.0',
+    // ── 多币种 ──
+    symbolList: ['btc', 'eth', 'xrp'],
+    activeSymbol: 'btc',
+    symbolsData: {},
+    stratVersion: '2.0',
 
-    // ── 窗口 ──
-    elapsedPct: 0,
-    secsLeft: 0,
-    entryZone: 'SCAN',
-    targetAsk: 0.01,
-    boughtSides: [],
+    // ── 当前币种 (计算属性) ──
+    get cur() {
+      return this.symbolsData[this.activeSymbol] || {..._emptySymbol};
+    },
 
-    // ── 下注 ──
-    betsThisWindow: 0,
-    maxBetsPerWindow: 2,
-    costThisWindow: 0,
-    maxCostPerWindow: 20,
-    cumUpShares: 0,
-    cumDnShares: 0,
-
-    // ── 统计 ──
-    tradeCount: 0,
-    winCount: 0,
-    lossCount: 0,
-    cumulativePnl: 0,
-    winRate: 0,
-    paramEntries: [],
+    // ── 汇总 ──
+    agg: { trade_count: 0, win_count: 0, loss_count: 0, cumulative_pnl: 0, win_rate: 0 },
 
     // ── 账户 ──
     account: { balance: 0, available: 0, total_equity: 0, daily_pnl: 0 },
 
-    // ── 历史 ──
-    settlementHistory: [],
-    entryHistory: [],
+    // ── 参数 ──
+    paramEntries: [],
+
+    // ── 过滤后历史 ──
+    get settlementHistory() {
+      const h = (this.cur.trade_history || []).filter(t => t.action === 'SETTLE');
+      return h;
+    },
+    get entryHistory() {
+      const h = (this.cur.trade_history || []).filter(t => t.action === 'ENTRY');
+      return h;
+    },
 
     // ── 图表 ──
-    priceHistory: [],
-    _btcIdx: 0,
+    _priceHistories: {},
+    _chartIdx: {},
     _chartMaxPoints: 1800,
 
     init() {
+      for (const sym of this.symbolList) {
+        this.symbolsData[sym] = {..._emptySymbol, symbol: sym};
+        this._priceHistories[sym] = [];
+        this._chartIdx[sym] = 0;
+      }
       this.syncFromGlobal();
       window.addEventListener('dash:strategy', (e) => this.onStrategy(e.detail));
       window.addEventListener('dash:heartbeat', () => this.syncFromGlobal());
       window.addEventListener('dash:snapshot', () => this.syncFromGlobal());
       setTimeout(() => this._initBtcChart(), 500);
+      // Tab 切换时重绘
+      this.$watch('activeSymbol', () => this._redrawChart());
     },
 
     syncFromGlobal() {
@@ -358,9 +426,7 @@ function strategyPage() {
     _getAppState() {
       try {
         const appEl = document.querySelector('[x-data="app()"]');
-        if (appEl && appEl._x_dataStack) {
-          return appEl._x_dataStack[0];
-        }
+        if (appEl && appEl._x_dataStack) return appEl._x_dataStack[0];
       } catch (e) {}
       return {};
     },
@@ -378,43 +444,50 @@ function strategyPage() {
 
     applyState(st) {
       if (st.strategy_type && st.strategy_type !== 'tail_reversal') return;
-
-      // ── 市场 ──
-      if (st.rtds_price !== undefined) this.rtdsPrice = st.rtds_price;
-      if (st.window_ptb !== undefined) this.windowPtb = st.window_ptb;
-      if (st.deviation !== undefined) this.deviation = st.deviation;
-      if (st.cheap_side) this.cheapSide = st.cheap_side;
-      if (st.cheap_ask !== undefined) this.cheapAsk = st.cheap_ask;
-      if (st.up_ask !== undefined) this.upAsk = st.up_ask;
-      if (st.dn_ask !== undefined) this.dnAsk = st.dn_ask;
-      if (st.btc_vol_30s !== undefined) this.btcVol30s = st.btc_vol_30s;
       if (st.version) this.stratVersion = st.version;
 
-      // ── 窗口 ──
-      if (st.elapsed_pct !== undefined) this.elapsedPct = st.elapsed_pct;
-      if (st.secs_left !== undefined) this.secsLeft = st.secs_left;
-      if (st.entry_zone) this.entryZone = st.entry_zone;
-      if (st.target_ask !== undefined) this.targetAsk = st.target_ask;
-      if (st.bought_sides) this.boughtSides = st.bought_sides;
+      // ── 多币种数据 ──
+      if (st.symbols) {
+        for (const [sym, data] of Object.entries(st.symbols)) {
+          if (!this.symbolsData[sym]) {
+            this.symbolsData[sym] = {..._emptySymbol, symbol: sym};
+            this._priceHistories[sym] = [];
+            this._chartIdx[sym] = 0;
+          }
+          Object.assign(this.symbolsData[sym], data);
+          // 图表数据
+          if (data.rtds_price > 0) {
+            const idx = this._chartIdx[sym]++;
+            this._priceHistories[sym].push({ idx, p: data.rtds_price, ptb: data.window_ptb || 0 });
+            if (this._priceHistories[sym].length > this._chartMaxPoints) {
+              this._priceHistories[sym] = this._priceHistories[sym].slice(-this._chartMaxPoints);
+            }
+          }
+        }
+        if (st.symbol_list) this.symbolList = st.symbol_list;
+      } else {
+        // Legacy 单币种 fallback (BTC)
+        const btcData = {};
+        for (const k of Object.keys(_emptySymbol)) {
+          if (st[k] !== undefined) btcData[k] = st[k];
+        }
+        if (Object.keys(btcData).length) {
+          Object.assign(this.symbolsData['btc'], btcData);
+        }
+        if (st.rtds_price > 0) {
+          const idx = this._chartIdx['btc']++;
+          this._priceHistories['btc'].push({ idx, p: st.rtds_price, ptb: st.window_ptb || 0 });
+        }
+      }
 
-      // ── 下注 ──
-      if (st.bets_this_window !== undefined) this.betsThisWindow = st.bets_this_window;
-      if (st.max_bets_per_window !== undefined) this.maxBetsPerWindow = st.max_bets_per_window;
-      if (st.cost_this_window !== undefined) this.costThisWindow = st.cost_this_window;
-      if (st.max_cost_per_window !== undefined) this.maxCostPerWindow = st.max_cost_per_window;
-      if (st.cum_up_shares !== undefined) this.cumUpShares = st.cum_up_shares;
-      if (st.cum_dn_shares !== undefined) this.cumDnShares = st.cum_dn_shares;
-
-      // ── 统计 ──
-      if (st.trade_count !== undefined) this.tradeCount = st.trade_count;
-      if (st.win_count !== undefined) this.winCount = st.win_count;
-      if (st.loss_count !== undefined) this.lossCount = st.loss_count;
-      if (st.cumulative_pnl !== undefined) this.cumulativePnl = st.cumulative_pnl;
-      if (st.win_rate !== undefined) this.winRate = st.win_rate;
+      // ── 汇总 ──
+      if (st.aggregate) {
+        this.agg = st.aggregate;
+      }
 
       // ── 参数 ──
       if (st.params) {
-        this.paramEntries = Object.entries(st.params).filter(([k, v]) => typeof v !== 'object');
+        this.paramEntries = Object.entries(st.params);
       }
 
       // ── 账户 ──
@@ -427,22 +500,15 @@ function strategyPage() {
         };
       }
 
-      // ── 历史 ──
-      if (st.trade_history) {
-        this.settlementHistory = st.trade_history.filter(t => t.action === 'SETTLE');
-        this.entryHistory = st.trade_history.filter(t => t.action === 'ENTRY');
-      }
-
-      // ── 图表 ──
-      this._pushPricePoint(st.rtds_price || 0, st.window_ptb || this.windowPtb);
+      // ── 更新当前 tab 的图表 ──
+      this._updateChart();
     },
 
-    // ════════════ Chart.js BTC 行情图 ════════════
+    // ════════════ Chart.js 行情图 ════════════
 
     _initBtcChart() {
       const canvas = document.getElementById('chart-btc');
       if (!canvas) return;
-
       canvas._chartInstance = new Chart(canvas.getContext('2d'), {
         type: 'line',
         data: {
@@ -453,10 +519,6 @@ function strategyPage() {
           }, {
             label: 'PTB', data: [], borderColor: '#d29922', borderWidth: 1,
             borderDash: [4,4], pointRadius: 0, fill: false, order: 3
-          }, {
-            label: '入场', data: [], type: 'scatter',
-            backgroundColor: '#22c55e', borderColor: '#22c55e',
-            pointRadius: 6, pointStyle: 'crossRot', showLine: false, order: 1
           }]
         },
         options: {
@@ -477,30 +539,17 @@ function strategyPage() {
       });
     },
 
-    _pushPricePoint(rtds, ptb) {
-      if (rtds <= 0) return;
-      const idx = this._btcIdx++;
-      this.priceHistory.push({ idx, rtds, ptb });
-      if (this.priceHistory.length > this._chartMaxPoints) {
-        this.priceHistory = this.priceHistory.slice(-this._chartMaxPoints);
-      }
-
+    _updateChart() {
       const chart = document.getElementById('chart-btc')?._chartInstance;
       if (!chart) return;
-
-      chart.data.datasets[0].data = this.priceHistory.filter(h => h.rtds > 0).map(h => ({x: h.idx, y: h.rtds}));
-      chart.data.datasets[1].data = this.priceHistory.filter(h => h.ptb > 0).map(h => ({x: h.idx, y: h.ptb}));
-
-      // 入场点标记 (简化: 映射到最近的 priceHistory idx)
-      if (this.entryHistory.length > 0) {
-        const entries = this.entryHistory.slice(-20).map(e => ({
-          x: this.priceHistory.length > 0 ? this.priceHistory[Math.min(this.priceHistory.length-1, Math.max(0, this.priceHistory.length - (this.entryHistory.length - this.entryHistory.indexOf(e))))].idx : 0,
-          y: e.btc || e.ptb || rtds
-        }));
-        chart.data.datasets[2].data = entries;
-      }
-
+      const hist = this._priceHistories[this.activeSymbol] || [];
+      chart.data.datasets[0].data = hist.filter(h => h.p > 0).map(h => ({x: h.idx, y: h.p}));
+      chart.data.datasets[1].data = hist.filter(h => h.ptb > 0).map(h => ({x: h.idx, y: h.ptb}));
       chart.update('none');
+    },
+
+    _redrawChart() {
+      this._updateChart();
     },
   };
 }

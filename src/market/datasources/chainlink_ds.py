@@ -59,6 +59,10 @@ class ChainlinkConfig:
     rtds_ws: str = "wss://ws-live-data.polymarket.com"
     rtds_ping_interval: float = 5.0  # RTDS 要求 ~5s 发送一次 ping
 
+    # ── 多币种订阅 (RTDS 支持 btc/eth/sol/xrp) ──
+    # 符号格式: "btc/usd", "eth/usd", "xrp/usd" 等
+    symbols: list[str] = field(default_factory=lambda: ["btc/usd", "eth/usd", "xrp/usd"])
+
     # ── Chainlink Data Streams API (需要 API 密钥, 与 PM 结算完全一致) ──
     # 申请: https://chain.link/data-streams
     # 赞助通道 (通过 PM): https://pm-ds-request.streams.chain.link/
@@ -380,10 +384,12 @@ class ChainlinkDataSource(DataSourceBase):
     # ================================================================
 
     def _parse_rtds_price(
-        self, raw: str, symbol_filter: str = "btc/usd"
-    ) -> list[tuple[float, float]]:
+        self, raw: str, symbol_filter: str | set | None = None
+    ) -> list[tuple[str, float, float]]:
         """
-        解析 RTDS 消息, 返回 [(price, ts_sec), ...] 列表。
+        解析 RTDS 消息, 返回 [(symbol_short, price, ts_sec), ...] 列表。
+
+        symbol_short: "btc", "eth", "xrp" 等 (从 payload.symbol "btc/usd" 提取)
 
         RTDS 消息格式:
           1) 订阅确认 (type=subscribe): {"payload":{"data":[...], "symbol":"btc/usd"}} — 含历史快照
@@ -391,7 +397,11 @@ class ChainlinkDataSource(DataSourceBase):
           3) 空字符串: 连接确认, 跳过
 
         注意: 不带 filters 订阅时, 会收到所有币种 (btc/eth/sol/xrp),
-              需通过 payload.symbol 过滤。
+              通过 symbol_filter 过滤。
+              symbol_filter 可以是:
+                - str: 精确匹配 (如 "btc/usd")
+                - set: 多符号匹配 (如 {"btc/usd", "eth/usd"})
+                - None: 不过滤, 返回所有
         """
         if not raw or not raw.strip():
             return []
@@ -401,30 +411,41 @@ class ChainlinkDataSource(DataSourceBase):
             logger.debug(f"RTDS 非 JSON 消息, 跳过: {raw[:120]}")
             return []
 
-        results: list[tuple[float, float]] = []
+        results: list[tuple[str, float, float]] = []
         payload = obj.get("payload", {})
         if not isinstance(payload, dict):
             return []
 
         msg_type = obj.get("type", "")
 
+        def _match_symbol(sym: str) -> bool:
+            if symbol_filter is None:
+                return True
+            if isinstance(symbol_filter, str):
+                return sym == symbol_filter
+            return sym in symbol_filter
+
+        def _sym_short(sym: str) -> str:
+            """'btc/usd' → 'btc'"""
+            return sym.split("/")[0] if "/" in sym else sym
+
         # ── 格式 1: type=update, 单值实时推送 (每秒 ~1 条/币种) ──
         if msg_type == "update":
             sym = payload.get("symbol", "").lower()
-            if symbol_filter and sym != symbol_filter:
+            if not _match_symbol(sym):
                 return []  # 非目标币种, 跳过
             price = float(payload.get("value", 0))
             if price > 0:
                 ts = payload.get("timestamp", time.time() * 1000)
                 if ts > 1e12:
                     ts = ts / 1000.0
-                results.append((price, ts))
+                results.append((_sym_short(sym), price, ts))
             return results
 
         # ── 格式 2: type=subscribe, 历史快照 (payload.data 数组) ──
         if msg_type == "subscribe":
             sym = payload.get("symbol", "").lower()
-            if symbol_filter and sym != symbol_filter:
+            if not _match_symbol(sym):
                 return []
             data_arr = payload.get("data")
             if isinstance(data_arr, list):
@@ -434,19 +455,19 @@ class ChainlinkDataSource(DataSourceBase):
                     if ts > 1e12:
                         ts = ts / 1000.0
                     if price > 0:
-                        results.append((price, ts))
+                        results.append((_sym_short(sym), price, ts))
             return results
 
         # ── 兼容: 其他未知格式, 尝试提取 value ──
         price = float(payload.get("value", 0))
         if price > 0:
             sym = payload.get("symbol", "").lower()
-            if symbol_filter and sym and sym != symbol_filter:
+            if not _match_symbol(sym):
                 return []
             ts = payload.get("timestamp", time.time() * 1000)
             if ts > 1e12:
                 ts = ts / 1000.0
-            results.append((price, ts))
+            results.append((_sym_short(sym), price, ts))
         return results
 
     async def _test_rtds_connection(self) -> float:
@@ -479,9 +500,9 @@ class ChainlinkDataSource(DataSourceBase):
                     if time.time() - start > 10:
                         break
                     if msg.type == aiohttp.WSMsgType.TEXT:
-                        prices = self._parse_rtds_price(msg.data)
+                        prices = self._parse_rtds_price(msg.data, symbol_filter="btc/usd")
                         if prices:
-                            return prices[-1][0]  # 返回最新价格
+                            return prices[-1][1]  # (sym, price, ts) → price
                     elif msg.type in (
                         aiohttp.WSMsgType.ERROR,
                         aiohttp.WSMsgType.CLOSED,
@@ -502,8 +523,8 @@ class ChainlinkDataSource(DataSourceBase):
           2) type=subscribe → 历史快照 payload.data[{timestamp, value}]
           3) type=update   → 实时推送 payload.{symbol, value, timestamp} (每秒/每币种)
 
-        客户端通过 _parse_rtds_price(symbol_filter="btc/usd") 过滤非 BTC 消息。
-        看门狗: 30s 无 BTC 价格数据则断开重连 (正常情况每秒有 ~1 条 BTC 推送)。
+        客户端通过 _parse_rtds_price(symbol_filter=set(config.symbols)) 过滤非目标币种。
+        看门狗: 30s 无价格数据则断开重连 (正常情况每秒有 ~1 条推送/币种)。
 
         重连策略: 指数退避 (2s → 4s → 8s → ... → 60s), 不降级到 Binance。
         RTDS 是 PM 结算的权威数据源, 切换到 Binance 会引入价差风险。
@@ -529,7 +550,7 @@ class ChainlinkDataSource(DataSourceBase):
                             }
                         ],
                     })
-                    logger.debug("PM RTDS WebSocket 已连接, 订阅 crypto_prices_chainlink (无filter, 客户端过滤btc/usd)")
+                    logger.debug(f"PM RTDS WebSocket 已连接, 订阅 crypto_prices_chainlink (客户端过滤: {self.config.symbols})")
                     reconnect_delay = 2.0  # 连接成功, 重置退避
 
                     # 数据静默看门狗: 跟踪最后一次收到 BTC 价格的时间
@@ -559,11 +580,14 @@ class ChainlinkDataSource(DataSourceBase):
                             if not self._running:
                                 break
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                prices = self._parse_rtds_price(msg.data)
+                                prices = self._parse_rtds_price(
+                                    msg.data,
+                                    symbol_filter=set(self.config.symbols),
+                                )
                                 if prices:
                                     last_data_time = time.time()
-                                for price, ts in prices:
-                                    await self._on_price_update(price, ts)
+                                for sym, price, ts in prices:
+                                    await self._on_price_update(price, ts, symbol=sym)
                             elif msg.type in (
                                 aiohttp.WSMsgType.ERROR,
                                 aiohttp.WSMsgType.CLOSED,
@@ -760,25 +784,34 @@ class ChainlinkDataSource(DataSourceBase):
     #  价格处理与 K线聚合
     # ================================================================
 
-    async def _on_price_update(self, price: float, timestamp: float) -> None:
-        """处理价格更新: 发布事件 + K线聚合"""
-        self._last_price = price
-        self._last_price_ts = timestamp
+    async def _on_price_update(
+        self, price: float, timestamp: float, symbol: str = "btc"
+    ) -> None:
+        """处理价格更新: 发布事件 + K线聚合
+
+        Args:
+            symbol: 币种短名 ("btc", "eth", "xrp")
+        """
+        # 始终更新 BTC 的 legacy 缓存 (供 get_current_price 使用)
+        if symbol == "btc":
+            self._last_price = price
+            self._last_price_ts = timestamp
 
         tick = Tick(
-            symbol="BTC/USD",
+            symbol=f"{symbol.upper()}/USD",
             price=price,
             timestamp=timestamp,
             source=f"chainlink:{self._active_source}",
         )
 
         if self.event_bus:
-            # Chainlink 专用事件 (包含数据源层级信息)
+            # Chainlink 专用事件 (包含数据源层级信息 + 币种标识)
             await self.event_bus.publish(Event(
                 type=EventType.CHAINLINK_PRICE,
                 data={
                     "tick": tick,
                     "price": price,
+                    "symbol": symbol,
                     "source": self._active_source,
                     "timestamp": timestamp,
                 },
@@ -791,8 +824,9 @@ class ChainlinkDataSource(DataSourceBase):
                 source="chainlink",
             ))
 
-        # K线聚合
-        self._aggregate_kline(price, timestamp)
+        # K线聚合 (仅 BTC, 其他币种暂不需要 K线)
+        if symbol == "btc":
+            self._aggregate_kline(price, timestamp)
 
     def _aggregate_kline(self, price: float, timestamp: float) -> None:
         """tick → K线聚合, 闭合时发布事件"""

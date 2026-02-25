@@ -342,6 +342,7 @@ async def run_live(cfg: dict, ctx: Context):
             ),
             poll_interval=chainlink_cfg.get("poll_interval", 2.0),
             mode=chainlink_cfg.get("mode", "auto"),
+            symbols=chainlink_cfg.get("symbols", ["btc/usd", "eth/usd", "xrp/usd"]),
         ),
     )
     pm_cfg = ds_cfg.get("polymarket", {})
@@ -350,6 +351,7 @@ async def run_live(cfg: dict, ctx: Context):
         market_ids=pm_cfg.get("market_ids", []),
         search_query=pm_cfg.get("search_query", "Bitcoin"),
         poll_interval=pm_cfg.get("poll_interval", 5.0),
+        symbols=pm_cfg.get("symbols", ["btc", "eth", "xrp"]),
     )
 
     # ── 加载策略 ────
@@ -370,36 +372,47 @@ async def run_live(cfg: dict, ctx: Context):
     _PRICE_BUFFER_MAX = 600  # 保留约 10 分钟 (按 ~1 tick/s)
 
     async def _sync_btc_price(event: Event):
-        """CHAINLINK_PRICE → ctx.market.btc_price + 写入价格缓冲区 + PTB 捕获"""
+        """CHAINLINK_PRICE → ctx.markets[symbol].price + PTB 捕获 (多币种)"""
         price = event.data.get("price", 0)
-        if price > 0:
-            # 只在价格真正变化时更新 updated_at
-            if abs(price - ctx.market.btc_price) > 0.01:
-                ctx.market.btc_price_updated_at = event.timestamp
-            ctx.market.btc_price = price
-            ctx.market.last_update = event.timestamp
-            # 写入缓冲区
+        symbol = event.data.get("symbol", "btc")  # btc / eth / xrp
+        if price <= 0:
+            return
+
+        mkt = ctx.markets.get(symbol)
+        if not mkt:
+            return
+
+        # 通用字段更新
+        if abs(price - mkt.price) > 0.001:
+            mkt.price_updated_at = event.timestamp
+        mkt.price = price
+        mkt.last_update = event.timestamp
+
+        # BTC 向后兼容 (legacy 字段 + 全局缓冲区)
+        if symbol == "btc":
+            if abs(price - mkt.btc_price) > 0.01:
+                mkt.btc_price_updated_at = event.timestamp
+            mkt.btc_price = price
+            # BTC 价格缓冲区 (PTB 回溯用)
             _price_buffer.append((event.timestamp, price))
             if len(_price_buffer) > _PRICE_BUFFER_MAX:
                 _price_buffer[:] = _price_buffer[-_PRICE_BUFFER_MAX:]
 
-            # ━━ 基准价格 (PTB) 精确捕获 ━━
-            # RTDS 的 payload.timestamp = Chainlink observationsTimestamp
-            # 这是链上观测时间 (精确整数秒), 比本地收到时间早 ~1.5s
-            # Polymarket 规则: "price at the beginning of that range"
-            # 即 observationsTimestamp % 300 == 0 的那个 tick 的价格
-            rtds_ts = event.data.get("timestamp", 0)
-            if rtds_ts > 0:
-                rtds_ts_int = int(rtds_ts)
-                if rtds_ts_int % 300 == 0:
-                    window_start_ts = rtds_ts_int
-                    old_ptb = ctx.market.pm_window_start_price
-                    ctx.market.pm_window_start_price = price
-                    ctx.market.pm_window_start_ts = window_start_ts
-                    logger.info(
-                        f"⚡ PTB 捕获 (Chainlink observationsTimestamp={rtds_ts_int}): "
-                        f"${price:,.2f} (旧=${old_ptb:,.2f})"
-                    )
+        # ━━ 基准价格 (PTB) 精确捕获 ━━
+        # RTDS 的 payload.timestamp = Chainlink observationsTimestamp
+        # 当 observationsTimestamp % 300 == 0 时 = 5-min 窗口边界
+        rtds_ts = event.data.get("timestamp", 0)
+        if rtds_ts > 0:
+            rtds_ts_int = int(rtds_ts)
+            if rtds_ts_int % 300 == 0:
+                window_start_ts = rtds_ts_int
+                old_ptb = mkt.pm_window_start_price
+                mkt.pm_window_start_price = price
+                mkt.pm_window_start_ts = window_start_ts
+                logger.info(
+                    f"⚡ [{symbol.upper()}] PTB 捕获 (observationsTimestamp={rtds_ts_int}): "
+                    f"${price:,.4f} (旧=${old_ptb:,.4f})"
+                )
 
     def _lookup_price_at(target_ts: float) -> float:
         """在缓冲区中找到最接近 target_ts 的价格 (优先取 <= target_ts 的最新值)"""
@@ -440,71 +453,86 @@ async def run_live(cfg: dict, ctx: Context):
         return _cb
 
     async def _sync_pm_price(event: Event):
-        """PM_PRICE → ctx.market.pm_yes_price / pm_no_price"""
+        """PM_PRICE → ctx.markets[symbol] 的 PM 字段 (多币种)"""
         data = event.data or {}
+        symbol = data.get("symbol", "btc")
+        mkt = ctx.markets.get(symbol)
+        if not mkt:
+            return
+
         if "yes_price" in data:
-            ctx.market.pm_yes_price = data["yes_price"]
+            mkt.pm_yes_price = data["yes_price"]
         if "no_price" in data:
-            ctx.market.pm_no_price = data["no_price"]
+            mkt.pm_no_price = data["no_price"]
         if "yes_bid" in data:
-            ctx.market.pm_yes_bid = data["yes_bid"]
+            mkt.pm_yes_bid = data["yes_bid"]
         if "yes_ask" in data:
-            ctx.market.pm_yes_ask = data["yes_ask"]
+            mkt.pm_yes_ask = data["yes_ask"]
         if "no_bid" in data:
-            ctx.market.pm_no_bid = data["no_bid"]
+            mkt.pm_no_bid = data["no_bid"]
         if "no_ask" in data:
-            ctx.market.pm_no_ask = data["no_ask"]
+            mkt.pm_no_ask = data["no_ask"]
         if "question" in data:
-            ctx.market.pm_market_question = data["question"]
-            ctx.market.pm_market_active = True
+            mkt.pm_market_question = data["question"]
+            mkt.pm_market_active = True
         if "condition_id" in data:
-            ctx.market.pm_market_id = data["condition_id"]
-            ctx.market.pm_condition_id = data["condition_id"]
+            mkt.pm_market_id = data["condition_id"]
+            mkt.pm_condition_id = data["condition_id"]
         if "neg_risk" in data:
-            ctx.market.pm_neg_risk = data["neg_risk"]
+            mkt.pm_neg_risk = data["neg_risk"]
         # 同步 CLOB token IDs (下单必须)
         tids = data.get("token_ids", [])
         if len(tids) >= 1:
-            ctx.market.pm_yes_token_id = tids[0]
+            mkt.pm_yes_token_id = tids[0]
         if len(tids) >= 2:
-            ctx.market.pm_no_token_id = tids[1]
-        # 窗口切换时预热新 token 的 SDK 缓存 (避免首笔下单隐式网络调用)
-        if tids and executor._clob and executor._clob.is_ready:
-            neg_risk = data.get("neg_risk", True)
-            asyncio.create_task(executor._clob.warmup_cache(tids[:2], neg_risk))
-        # 窗口切换时重新注册 WS Book 回调 (新 token_ids)
-        if tids:
-            _new_ob_map: dict[str, OrderBook] = {}
-            if len(tids) >= 1:
-                _new_ob_map[tids[0]] = orderbook_up
-            if len(tids) >= 2:
-                _new_ob_map[tids[1]] = orderbook_down
-            polymarket_ds._book_callbacks.clear()
-            for _tid, _ob in _new_ob_map.items():
-                _lbl = "UP" if _ob is orderbook_up else "DOWN"
-                polymarket_ds.register_book_callback(
-                    _tid, _make_book_ws_cb(_ob, _lbl)
-                )
+            mkt.pm_no_token_id = tids[1]
+
+        # BTC: WS Book 回调 + CLOB 缓存预热 (目前仅 BTC 需要 orderbook)
+        if symbol == "btc":
+            if tids and executor._clob and executor._clob.is_ready:
+                neg_risk = data.get("neg_risk", True)
+                asyncio.create_task(executor._clob.warmup_cache(tids[:2], neg_risk))
+            if tids:
+                _new_ob_map: dict[str, OrderBook] = {}
+                if len(tids) >= 1:
+                    _new_ob_map[tids[0]] = orderbook_up
+                if len(tids) >= 2:
+                    _new_ob_map[tids[1]] = orderbook_down
+                polymarket_ds._book_callbacks.clear()
+                for _tid, _ob in _new_ob_map.items():
+                    _lbl = "UP" if _ob is orderbook_up else "DOWN"
+                    polymarket_ds.register_book_callback(
+                        _tid, _make_book_ws_cb(_ob, _lbl)
+                    )
+
         if "seconds_left" in data:
-            ctx.market.pm_window_seconds_left = data["seconds_left"]
+            mkt.pm_window_seconds_left = data["seconds_left"]
+
         # 检测 5-min 窗口切换 → 用缓冲区回溯基准价格 (Price to Beat)
-        # 注意: 这里仅作为辅助路径, 主要 PTB 由 _sync_btc_price 中的
-        # observationsTimestamp % 300 == 0 检测完成
         wst = data.get("window_start_ts", 0)
-        if wst and wst != ctx.market.pm_window_start_ts:
-            ctx.market.pm_window_start_ts = wst
-            # 如果 RTDS observationsTimestamp 尚未设置过, 则从缓冲区回溯
-            if ctx.market.pm_window_start_price <= 0:
+        if wst and wst != mkt.pm_window_start_ts:
+            mkt.pm_window_start_ts = wst
+            # 如果 RTDS observationsTimestamp 尚未设置过, 则从缓冲区回溯 (仅 BTC)
+            if mkt.pm_window_start_price <= 0 and symbol == "btc":
                 ptb = _lookup_price_at(float(wst))
                 if ptb <= 0:
-                    ptb = ctx.market.btc_price
+                    ptb = mkt.btc_price
                 if ptb > 0:
-                    ctx.market.pm_window_start_price = ptb
+                    mkt.pm_window_start_price = ptb
                     logger.info(
-                        f"新 5-min 窗口 ts={wst}, "
-                        f"基准价格(PTB/辅助)=${ptb:,.2f}"
+                        f"[{symbol.upper()}] 新 5-min 窗口 ts={wst}, "
+                        f"基准价格(PTB/辅助)=${ptb:,.4f}"
                     )
-        ctx.market.last_update = event.timestamp
+            # 非 BTC: 从通用 price 字段取 PTB
+            elif mkt.pm_window_start_price <= 0:
+                ptb = mkt.price
+                if ptb > 0:
+                    mkt.pm_window_start_price = ptb
+                    logger.info(
+                        f"[{symbol.upper()}] 新 5-min 窗口 ts={wst}, "
+                        f"基准价格(PTB)=${ptb:,.4f}"
+                    )
+        mkt.last_update = event.timestamp
 
     bus.subscribe(EventType.CHAINLINK_PRICE, _sync_btc_price, priority=100)
     bus.subscribe(EventType.PM_PRICE, _sync_pm_price, priority=100)
@@ -573,6 +601,7 @@ async def run_live(cfg: dict, ctx: Context):
         # 立即同步初始价格到 ctx (稍后 RTDS 流式推送会持续更新)
         if chainlink_ds._last_price and chainlink_ds._last_price > 0:
             ctx.market.btc_price = chainlink_ds._last_price
+            ctx.market.price = chainlink_ds._last_price
             logger.info(f"初始 BTC 价格: ${chainlink_ds._last_price:,.2f}")
         logger.info("Chainlink BTC/USD 数据源已连接")
         tasks.append(asyncio.create_task(chainlink_ds.start_streaming()))
@@ -583,8 +612,8 @@ async def run_live(cfg: dict, ctx: Context):
         await polymarket_ds.connect()
         logger.info("Polymarket 数据源已连接")
 
-        # ── 注册 WS Book 回调: 实时推送 OB 数据到 OrderBook 对象 ────
-        pm_mkt = polymarket_ds._active_market
+        # ── 注册 WS Book 回调: 实时推送 OB 数据到 OrderBook 对象 (仅 BTC) ────
+        pm_mkt = polymarket_ds._active_markets.get("btc")
         if pm_mkt and pm_mkt.token_ids:
             _ob_map = {}  # token_id → OrderBook
             if len(pm_mkt.token_ids) >= 1:
