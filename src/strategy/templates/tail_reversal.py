@@ -74,6 +74,9 @@ class _SymbolState:
     deviation_stats: list = field(default_factory=list)
     window_deviations: list = field(default_factory=list)
 
+    # ── 窗口切换时间 (用于入场延迟) ──
+    window_switch_time: float = 0.0
+
     # ── 下注冷却 ──
     last_bet_time: float = 0.0
 
@@ -230,6 +233,7 @@ class TailReversalStrategy(Strategy):
             if ss.last_window_ts > 0:
                 await self._settle_position(ctx, mkt, ss)
             ss.last_window_ts = wst
+            ss.window_switch_time = ctx.now()
             ss.bets_this_window = 0
             ss.cost_this_window = 0.0
             ss.bought_sides.clear()
@@ -265,12 +269,9 @@ class TailReversalStrategy(Strategy):
         if secs_left <= 0:
             return
 
-        # ── 窗口开始 5s 内不交易 (等价格稳定) ──
-        # 直接用系统时间计算, 不依赖 PM 轮询更新的 secs_left (可能有延迟)
+        # ── 窗口切换后 5s 内不交易 (等价格稳定) ──
         now_ts = ctx.now()
-        boundary_ts = (int(now_ts) // 300) * 300
-        real_elapsed = now_ts - boundary_ts
-        if real_elapsed < 5:
+        if ss.window_switch_time > 0 and (now_ts - ss.window_switch_time) < 5:
             return
 
         # ── 下注上限 ──
@@ -549,12 +550,7 @@ class TailReversalStrategy(Strategy):
                 continue
 
             secs_left = mkt.pm_window_seconds_left
-            # 用实时时间计算进度 (不依赖 PM 轮询延迟)
-            now_ts = ctx.now()
-            boundary_ts = (int(now_ts) // 300) * 300
-            real_elapsed = now_ts - boundary_ts
-            real_secs_left = max(300 - real_elapsed, 0)
-            elapsed_pct = real_elapsed / 300.0 if real_elapsed < 300 else (300 - secs_left) / 300.0 if secs_left > 0 else 0
+            elapsed_pct = (300 - secs_left) / 300.0 if secs_left > 0 else 0
             price = mkt.price if mkt.price > 0 else mkt.btc_price
             ptb = ss.window_ptb if ss.window_ptb > 0 else mkt.pm_window_start_price
             deviation = price - ptb if ptb > 0 else 0
@@ -607,7 +603,7 @@ class TailReversalStrategy(Strategy):
                 "cheap_ask": round(cheap_ask, 4) if cheap_ask else 0,
                 # ── 窗口进度 ──
                 "elapsed_pct": round(elapsed_pct * 100, 1),
-                "secs_left": round(real_secs_left, 0),
+                "secs_left": round(secs_left, 0),
                 "entry_zone": zone,
                 "target_ask": self._target_ask,
                 "bought_sides": list(ss.bought_sides),
