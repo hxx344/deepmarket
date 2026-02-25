@@ -26,7 +26,7 @@ strategy:
     max_cost_per_window: 20.0      # 每窗口最多 $20
 
     # ── 反向确认 (可选: 需要 BTC 有反向迹象再入场) ──
-    require_btc_counter_move: true # 需要检测到反向运动
+    require_btc_counter_move: false # 不要求反向运动，先观察触发频率
     counter_move_lookback_s: 5.0   # 5s 内回看
     counter_move_threshold: 1.0    # BTC 反向 ≥$1
 

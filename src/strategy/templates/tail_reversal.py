@@ -61,7 +61,7 @@ class TailReversalStrategy(Strategy):
         max_bets_per_window: int = 3,          # 单窗口最多下注次数
         max_cost_per_window: float = 20.0,     # 单窗口最大总投入
         # ── 方向确认 ──
-        require_btc_counter_move: bool = True, # 要求 BTC 短期有反向迹象
+        require_btc_counter_move: bool = False, # 不要求 BTC 短期有反向迹象
         counter_move_lookback_s: float = 5.0,  # 反向判断回看窗口
         counter_move_threshold: float = 1.0,   # BTC 反向 ≥ $1 才确认
         # ── 手续费 ──
@@ -111,6 +111,10 @@ class TailReversalStrategy(Strategy):
         self._loss_count: int = 0
         self._cumulative_pnl: float = 0.0
         self._tick_counter: int = 0
+
+        # ── RTDS偏离统计 (每笔下注时 BTC 偏离 PTB 的幅度) ──
+        self._deviation_stats: list[dict] = []  # 全局: 记录每笔下注的偏离信息
+        self._window_deviations: list[dict] = []  # 当前窗口
 
         # ── 下注冷却 (防止同tick多次下注) ──
         self._last_bet_time: float = 0.0
@@ -173,6 +177,7 @@ class TailReversalStrategy(Strategy):
         await self._tail_entry(context)
 
     def on_stop(self, context: Context) -> None:
+        self._log_deviation_summary()
         logger.info(
             f"[{self.name()}] 策略停止 | "
             f"总交易={self._trade_count} | "
@@ -197,6 +202,7 @@ class TailReversalStrategy(Strategy):
             self._cum_up_cost = 0.0
             self._cum_dn_cost = 0.0
             self._positions.clear()
+            self._window_deviations.clear()
             self._window_ptb = context.market.btc_price
             logger.info(
                 f"[{self.name()}] 新窗口 PTB=${self._window_ptb:,.2f} | "
@@ -325,6 +331,20 @@ class TailReversalStrategy(Strategy):
             self._last_bet_time = now
             self._trade_count += 1
 
+            # ── 记录RTDS偏离度 ──
+            deviation = btc - ptb  # 正=BTC>PTB(偏UP), 负=BTC<PTB(偏DN)
+            abs_dev = abs(deviation)
+            dev_record = {
+                "side": cheap_side,
+                "deviation": deviation,
+                "abs_deviation": abs_dev,
+                "btc": btc,
+                "ptb": ptb,
+                "entry_time": now,
+            }
+            self._window_deviations.append(dev_record)
+            self._deviation_stats.append(dev_record)
+
             self._positions.append({
                 "side": cheap_side,
                 "entry_price": cheap_ask,
@@ -334,6 +354,7 @@ class TailReversalStrategy(Strategy):
                 "odds": odds,
                 "btc_at_entry": btc,
                 "ptb": ptb,
+                "deviation": deviation,
             })
 
             ctx.account.balance -= actual_cost
@@ -342,6 +363,7 @@ class TailReversalStrategy(Strategy):
             logger.info(
                 f"[{self.name()}] ✓ 成交 {cheap_side} | "
                 f"{filled_shares:.1f}sh@{cheap_ask:.4f}=${actual_cost:.2f} | "
+                f"RTDS偏离PTB=${deviation:+.2f} (|{abs_dev:.2f}|) | "
                 f"累计投入: ${self._cost_this_window:.2f}/{self._max_cost_per_window:.0f}"
             )
 
@@ -395,25 +417,62 @@ class TailReversalStrategy(Strategy):
             p_won = pos["side"] == winner_side
             p_pnl = (pos["shares"] * 1.0 - pos["cost"]) if p_won else (-pos["cost"])
             p_str = "WIN" if p_won else "LOSE"
+            dev = pos.get("deviation", 0)
             logger.info(
                 f"[{self.name()}]   {p_str} {pos['side']}@{pos['entry_price']:.4f} | "
                 f"{pos['shares']:.1f}sh cost=${pos['cost']:.2f} | "
-                f"PnL=${p_pnl:+.2f} odds={pos['odds']:.1f}x"
+                f"PnL=${p_pnl:+.2f} odds={pos['odds']:.1f}x | "
+                f"RTDS偏离=${dev:+.2f}"
             )
+
+        # ── RTDS偏离统计 ──
+        dev_str = ""
+        if self._window_deviations:
+            devs = [d["abs_deviation"] for d in self._window_deviations]
+            avg_dev = sum(devs) / len(devs)
+            max_dev = max(devs)
+            dev_str = f" | 入场偏离: avg=${avg_dev:.2f} max=${max_dev:.2f}"
 
         logger.info(
             f"[{self.name()}] 结算 {result_str} | "
             f"赢家={winner_side} | BTC={btc:,.2f} vs PTB={ptb:,.2f} | "
-            f"投入=${total_cost:.2f} 回收=${payout:.2f} PnL=${net_pnl:+.2f} | "
+            f"投入=${total_cost:.2f} 回收=${payout:.2f} PnL=${net_pnl:+.2f}{dev_str} | "
             f"累计: W={self._win_count} L={self._loss_count} PnL=${self._cumulative_pnl:+.2f} | "
             f"余额=${ctx.account.balance:.2f}"
         )
+
+        # ── 全局偏离统计摘要 (每10次结算打一次) ──
+        total_settles = self._win_count + self._loss_count
+        if total_settles > 0 and total_settles % 10 == 0:
+            self._log_deviation_summary()
 
         self._positions.clear()
 
     # ================================================================
     #  辅助函数
     # ================================================================
+
+    def _log_deviation_summary(self) -> None:
+        """输出全局 RTDS 偏离统计, 按 WIN/LOSE 分组分析."""
+        if not self._deviation_stats:
+            return
+
+        # 关联 win/lose (简化: 按顺序与 _win_count/_loss_count 对应)
+        all_devs = [d["abs_deviation"] for d in self._deviation_stats]
+        avg_all = sum(all_devs) / len(all_devs)
+        min_all = min(all_devs)
+        max_all = max(all_devs)
+
+        # 按偏离大小分桶
+        small = [d for d in all_devs if d <= 10]
+        med = [d for d in all_devs if 10 < d <= 30]
+        large = [d for d in all_devs if d > 30]
+
+        logger.info(
+            f"[{self.name()}] 📊 RTDS偏离统计 (全局{len(all_devs)}笔) | "
+            f"avg=${avg_all:.2f} min=${min_all:.2f} max=${max_all:.2f} | "
+            f"≤$10: {len(small)}笔, $10-30: {len(med)}笔, >$30: {len(large)}笔"
+        )
 
     def _calc_btc_vol(self, now: float, lookback_s: float = 30.0) -> float:
         """计算 BTC 在近 lookback_s 秒内的价格波动幅度 (high - low)."""
