@@ -13,9 +13,9 @@ strategy:
     entry_start_pct: 0.80          # 进度 ≥80% 开始观察 (~60s left)
     entry_cutoff_pct: 0.95         # 进度 ≥95% 停止入场 (~15s left)
 
-    # ── 价格条件 (核心: 只买极度便宜的一侧) ──
-    cheap_side_max_price: 0.15     # ask ≤ 0.15 才入场 (≥6.7x 赔率)
-    cheap_side_min_price: 0.02     # ask ≥ 0.02 (太低=无流动性)
+    # ── 价格条件 (核心: 只买最便宜的一侧) ──
+    cheap_side_max_price: 0.01     # ask = 0.01 才入场 (100x 赔率)
+    cheap_side_min_price: 0.01     # ask = 0.01 (地板价)
 
     # ── 波动率过滤 ──
     min_btc_vol_30s: 5.0           # 30s 波幅 ≥$5 (要有翻转可能)

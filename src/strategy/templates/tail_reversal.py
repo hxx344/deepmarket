@@ -52,8 +52,8 @@ class TailReversalStrategy(Strategy):
         entry_start_pct: float = 0.80,         # 窗口进度 ≥80% 开始观察 (≈60s left)
         entry_cutoff_pct: float = 0.95,        # 窗口进度 ≥95% 停止入场 (≈15s left)
         # ── 价格条件 (核心) ──
-        cheap_side_max_price: float = 0.15,    # 便宜侧 ask ≤ 0.15 才入场 (≥6.7x 赔率)
-        cheap_side_min_price: float = 0.02,    # 便宜侧 ask ≥ 0.02 (太低=流动性差/价格不真实)
+        cheap_side_max_price: float = 0.01,    # 便宜侧 ask = 0.01 才入场 (100x 赔率)
+        cheap_side_min_price: float = 0.01,    # 地板价
         # ── 波动率过滤 ──
         min_btc_vol_30s: float = 5.0,          # 30s BTC 波动 ≥ $5 (有翻转可能)
         # ── 下注大小 ──
