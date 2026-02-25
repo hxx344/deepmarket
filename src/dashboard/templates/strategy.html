@@ -83,17 +83,17 @@
     <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-4">
       <div class="bg-surface-3 rounded-lg p-3 text-center">
         <p class="stat-label">RTDS 价格</p>
-        <p class="stat-value text-white !text-lg font-mono" x-text="'$' + cur.rtds_price.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</p>
+        <p class="stat-value text-white !text-lg font-mono" x-text="'$' + priceFmt(cur.rtds_price)">$0.00</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
         <p class="stat-label">PTB (基准价)</p>
-        <p class="stat-value text-yellow-400 !text-lg font-mono" x-text="'$' + cur.window_ptb.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</p>
+        <p class="stat-value text-yellow-400 !text-lg font-mono" x-text="'$' + priceFmt(cur.window_ptb)">$0.00</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
         <p class="stat-label">偏离 PTB</p>
         <p class="stat-value !text-lg font-mono"
            :class="cur.deviation >= 0 ? 'text-up' : 'text-down'"
-           x-text="(cur.deviation >= 0 ? '+' : '') + '$' + Math.abs(cur.deviation).toFixed(2)">$0.00</p>
+           x-text="(cur.deviation >= 0 ? '+' : '') + '$' + priceFmt(Math.abs(cur.deviation))">$0.00</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
         <p class="stat-label">便宜侧</p>
@@ -152,7 +152,7 @@
         (<span class="text-[#58a6ff]">CHAINLINK</span>)
       </h3>
       <span class="font-mono text-white text-lg font-bold"
-            x-text="'$' + cur.rtds_price.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</span>
+            x-text="'$' + priceFmt(cur.rtds_price)">$0.00</span>
     </div>
     <div style="position:relative; height:260px;">
       <canvas id="chart-btc" style="width:100% !important; height:100% !important;"></canvas>
@@ -272,7 +272,7 @@
               <td class="py-1.5 px-2 text-right font-mono"
                   :class="(s.pnl||0) >= 0 ? 'text-up' : 'text-down'"
                   x-text="((s.pnl||0) >= 0 ? '+' : '') + '$' + Math.abs(s.pnl||0).toFixed(2)"></td>
-              <td class="py-1.5 px-2 text-right font-mono text-gray-400" x-text="'$' + (s.deviation_avg||0).toFixed(2)"></td>
+              <td class="py-1.5 px-2 text-right font-mono text-gray-400" x-text="'$' + priceFmt(s.deviation_avg||0)"></td>
             </tr>
           </template>
         </tbody>
@@ -324,7 +324,7 @@
                   x-text="(t.odds || 0).toFixed(0) + 'x'"></td>
               <td class="py-1.5 px-2 text-right font-mono"
                   :class="(t.deviation || 0) >= 0 ? 'text-up' : 'text-down'"
-                  x-text="(t.deviation || 0) >= 0 ? '+$' + Math.abs(t.deviation||0).toFixed(2) : '-$' + Math.abs(t.deviation||0).toFixed(2)"></td>
+                  x-text="(t.deviation || 0) >= 0 ? '+$' + priceFmt(Math.abs(t.deviation||0)) : '-$' + priceFmt(Math.abs(t.deviation||0))"></td>
               <td class="py-1.5 px-2 text-right font-mono text-gray-400"
                   x-text="(t.elapsed_pct || 0).toFixed(0) + '%'"></td>
             </tr>
@@ -367,12 +367,26 @@ function strategyPage() {
     trade_history: [],
   };
 
+  // ── 每币种价格小数位 ──
+  const _priceDecimals = { btc: 2, eth: 2, xrp: 4 };
+
+  function priceFmt(val, sym) {
+    const s = sym || _activeSym || 'btc';
+    const d = _priceDecimals[s] || 2;
+    return val.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+  // expose to Alpine template scope
+  let _activeSym = 'btc';
+
   return {
     // ── 多币种 ──
     symbolList: ['btc', 'eth', 'xrp'],
     activeSymbol: 'btc',
     symbolsData: {},
     stratVersion: '2.0',
+
+    // price formatting helper (accessible in x-text)
+    priceFmt(val) { return priceFmt(val, this.activeSymbol); },
 
     // ── 当前币种 (计算属性) ──
     get cur() {
@@ -415,7 +429,7 @@ function strategyPage() {
       window.addEventListener('dash:snapshot', () => this.syncFromGlobal());
       setTimeout(() => this._initBtcChart(), 500);
       // Tab 切换时重绘
-      this.$watch('activeSymbol', () => this._redrawChart());
+      this.$watch('activeSymbol', () => { _activeSym = this.activeSymbol; this._redrawChart(); });
     },
 
     syncFromGlobal() {

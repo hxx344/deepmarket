@@ -129,6 +129,11 @@ class TailReversalStrategy(Strategy):
             s: _SymbolState(symbol=s) for s in self._symbols
         }
 
+        # 每币种价格小数位 (XRP 价格较小, 多保留 2 位)
+        self._price_decimals: dict[str, int] = {
+            "btc": 2, "eth": 2, "xrp": 4,
+        }
+
         # ── 全局限制 ──
         self._bet_cooldown_s: float = 2.0
         self._max_trade_history: int = 200
@@ -136,6 +141,10 @@ class TailReversalStrategy(Strategy):
     # ================================================================
     #  Strategy 接口
     # ================================================================
+
+    def _pd(self, sym: str) -> int:
+        """价格小数位数."""
+        return self._price_decimals.get(sym, 2)
 
     def name(self) -> str:
         return "tail_reversal"
@@ -232,7 +241,7 @@ class TailReversalStrategy(Strategy):
             ss.window_deviations.clear()
             ss.window_ptb = mkt.price if mkt.price > 0 else mkt.btc_price
             logger.info(
-                f"[{self.name()}:{ss.symbol.upper()}] 新窗口 PTB=${ss.window_ptb:,.2f} | "
+                f"[{self.name()}:{ss.symbol.upper()}] 新窗口 PTB=${ss.window_ptb:,.{self._pd(ss.symbol)}f} | "
                 f"等待 ask=0.01 买入机会"
             )
 
@@ -317,7 +326,7 @@ class TailReversalStrategy(Strategy):
                 f"[{self.name()}:{ss.symbol.upper()}] 🎯 ask=0.01 触发! | "
                 f"买{cheap_side}@{cheap_ask:.4f} ${bet:.2f} | "
                 f"赔率={odds:.1f}x 潜在利润=${potential_profit:.2f} | "
-                f"price={price:,.2f} vs PTB={ptb:,.2f} diff=${price_diff:.2f} | "
+                f"price={price:,.{self._pd(ss.symbol)}f} vs PTB={ptb:,.{self._pd(ss.symbol)}f} diff=${price_diff:.{self._pd(ss.symbol)}f} | "
                 f"elapsed={elapsed_pct:.1%} secs_left={secs_left:.0f}"
             )
 
@@ -382,9 +391,9 @@ class TailReversalStrategy(Strategy):
                     "shares": round(filled_shares, 1),
                     "cost": round(actual_cost, 2),
                     "odds": round(odds, 1),
-                    "deviation": round(deviation, 2),
-                    "coin_price": round(price, 2),
-                    "ptb": round(ptb, 2),
+                    "deviation": round(deviation, self._pd(ss.symbol)),
+                    "coin_price": round(price, self._pd(ss.symbol)),
+                    "ptb": round(ptb, self._pd(ss.symbol)),
                     "balance_after": round(ctx.account.balance, 2),
                     "elapsed_pct": round(elapsed_pct * 100, 1),
                     "secs_left": round(secs_left, 0),
@@ -395,7 +404,7 @@ class TailReversalStrategy(Strategy):
                 logger.info(
                     f"[{self.name()}:{ss.symbol.upper()}] ✓ 成交 {cheap_side} | "
                     f"{filled_shares:.1f}sh@{cheap_ask:.4f}=${actual_cost:.2f} | "
-                    f"偏离PTB=${deviation:+.2f} (|{abs_dev:.2f}|) | "
+                    f"偏离PTB=${deviation:+.{self._pd(ss.symbol)}f} (|{abs_dev:.{self._pd(ss.symbol)}f}|) | "
                     f"累计投入: ${ss.cost_this_window:.2f}/{self._max_cost_per_window:.0f}"
                 )
 
@@ -456,7 +465,7 @@ class TailReversalStrategy(Strategy):
                 f"[{self.name()}:{ss.symbol.upper()}]   {p_str} {pos['side']}@{pos['entry_price']:.4f} | "
                 f"{pos['shares']:.1f}sh cost=${pos['cost']:.2f} | "
                 f"PnL=${p_pnl:+.2f} odds={pos['odds']:.1f}x | "
-                f"偏离=${dev:+.2f}"
+                f"偏离=${dev:+.{self._pd(ss.symbol)}f}"
             )
 
         # ── 偏离统计 ──
@@ -465,11 +474,11 @@ class TailReversalStrategy(Strategy):
             devs = [d["abs_deviation"] for d in ss.window_deviations]
             avg_dev = sum(devs) / len(devs)
             max_dev = max(devs)
-            dev_str = f" | 入场偏离: avg=${avg_dev:.2f} max=${max_dev:.2f}"
+            dev_str = f" | 入场偏离: avg=${avg_dev:.{self._pd(ss.symbol)}f} max=${max_dev:.{self._pd(ss.symbol)}f}"
 
         logger.info(
             f"[{self.name()}:{ss.symbol.upper()}] 结算 {result_str} | "
-            f"赢家={winner_side} | price={price:,.2f} vs PTB={ptb:,.2f} | "
+            f"赢家={winner_side} | price={price:,.{self._pd(ss.symbol)}f} vs PTB={ptb:,.{self._pd(ss.symbol)}f} | "
             f"投入=${total_cost:.2f} 回收=${payout:.2f} PnL=${net_pnl:+.2f}{dev_str} | "
             f"累计: W={ss.win_count} L={ss.loss_count} PnL=${ss.cumulative_pnl:+.2f} | "
             f"余额=${ctx.account.balance:.2f}"
@@ -488,8 +497,8 @@ class TailReversalStrategy(Strategy):
             "size": round(total_cost, 2),
             "payout": round(payout, 2),
             "pnl": round(net_pnl, 4),
-            "coin_price": round(price, 2),
-            "ptb": round(ptb, 2),
+            "coin_price": round(price, self._pd(ss.symbol)),
+            "ptb": round(ptb, self._pd(ss.symbol)),
             "deviation_avg": round(
                 sum(d["abs_deviation"] for d in ss.window_deviations)
                 / len(ss.window_deviations), 2
@@ -576,13 +585,14 @@ class TailReversalStrategy(Strategy):
             total_pnl += ss.cumulative_pnl
             all_trade_history.extend(ss.trade_history)
 
+            pd = self._pd(sym)
             symbols_data[sym] = {
                 "symbol": sym.upper(),
                 # ── 市场数据 ──
-                "rtds_price": round(price, 2),
-                "window_ptb": round(ptb, 2),
-                "deviation": round(deviation, 2),
-                "abs_deviation": round(abs_dev, 2),
+                "rtds_price": round(price, pd),
+                "window_ptb": round(ptb, pd),
+                "deviation": round(deviation, pd),
+                "abs_deviation": round(abs_dev, pd),
                 "up_ask": round(up_ask, 4) if up_ask else 0,
                 "dn_ask": round(dn_ask, 4) if dn_ask else 0,
                 "cheap_side": cheap_side,
