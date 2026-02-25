@@ -195,7 +195,8 @@
           if (window._dashWs) {
             window._dashWs.destroy();
           }
-          const wsUrl = '{{ ws_url }}';
+          const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const wsUrl = `${wsProto}//${window.location.host}/ws`;
           window._dashWs = new DashboardWebSocket(wsUrl, {
             onOpen: () => { this.wsConnected = true; },
             onClose: () => { this.wsConnected = false; },

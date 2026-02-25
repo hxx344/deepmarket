@@ -195,5 +195,5 @@ class DashboardServer:
                 "pm_market_question": ctx.market.pm_market_question,
                 "pm_window_start_price": ctx.market.pm_window_start_price,
             },
-            "ws_url": f"ws://localhost:{self.port}/ws",
+            "ws_url": "",  # 由前端 JS 根据 window.location 自动构造
         }
