@@ -22,10 +22,17 @@
   python scripts/distill_signal.py --rich-only    # 仅用有ref_ts的高质量数据
   python scripts/distill_signal.py --pure-market  # 仅用纯市场特征 (排除持仓/行为)
   python scripts/distill_signal.py --compare      # 对比全特征 vs 纯市场特征
+  python scripts/distill_signal.py --outcome      # ⭐ 用窗口结算结果作为训练标签
+                                                   #   (预测哪边赢, 而非模仿0x1d)
+  python scripts/distill_signal.py --outcome --pure-market  # 推荐: 纯市场+结算标签
+
+评估指标:
+  模型评估以 **窗口PnL模拟** 为核心: 按信号下注 → 窗口结算 → 计算真实盈亏
+  而非简单的方向准确率。
 
 产出:
   data/distill_models/signal_model.pkl     — LightGBM 模型
-  data/distill_models/signal_config.json   — 特征列表 + 信号阈值
+  data/distill_models/signal_config.json   — 特征列表 + 信号阈值 + 训练模式
 """
 
 import sqlite3
@@ -173,6 +180,25 @@ EXCLUDED = [
 # ══════════════════════════════════════════════════════════════
 # 1. 数据加载
 # ══════════════════════════════════════════════════════════════
+
+def load_settlement_labels() -> dict:
+    """加载结算数据, 返回 {slug: {won, pnl}} 映射, 用于 outcome 标签和 PnL 模拟"""
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        "SELECT slug, pnl, won, up_cost, dn_cost, up_shares, dn_shares "
+        "FROM settlements ORDER BY settled_at"
+    ).fetchall()
+    conn.close()
+    settle = {}
+    for slug, pnl, won, u_cost, d_cost, u_sh, d_sh in rows:
+        settle[slug] = {
+            "pnl": pnl, "won": won,
+            "up_cost": u_cost or 0, "dn_cost": d_cost or 0,
+            "up_shares": u_sh or 0, "dn_shares": d_sh or 0,
+        }
+    print(f"加载 {len(settle)} 条结算记录")
+    return settle
+
 
 def load_trades(rich_only: bool = False) -> pd.DataFrame:
     """加载 trade_snaps, 解析 features JSON"""
@@ -329,21 +355,45 @@ def analyze_features(df: pd.DataFrame) -> list:
 
 def train_signal_model(df: pd.DataFrame, threshold: float = 0.60,
                        feature_set: list | None = None,
-                       label: str = "全特征"):
+                       label: str = "全特征",
+                       outcome_labels: dict | None = None):
     """
     训练实时入场信号模型:
       - 输入: 市场状态特征 (可选排除持仓特征)
       - 输出: P(UP), 用阈值分为 UP / DOWN / HOLD
       - 验证: GroupKFold (按窗口分组, 无时间泄漏)
+      - outcome_labels: 若提供, 以窗口结算赢方作为训练标签 (而非模仿 0x1d)
     """
     features = feature_set or SIGNAL_FEATURES
+    training_mode = "outcome" if outcome_labels else "mimicry"
     print("\n" + "=" * 72)
-    print(f"  训练: 实时入场信号模型 [{label}] ({len(features)} 特征)")
+    print(f"  训练: 实时入场信号模型 [{label}]")
+    print(f"  特征: {len(features)} | 训练标签: {'窗口结算结果' if outcome_labels else '模仿0x1d方向'}")
     print("=" * 72)
 
     X = df[features].copy()
-    y = (df["side"] == "UP").astype(int)       # 1=UP, 0=DOWN
     groups = df["slug"]                         # 按窗口分组
+
+    if outcome_labels:
+        # ── 结算标签: 1=UP赢, 0=DOWN赢 ──
+        df = df.copy()
+        df["_outcome"] = df["slug"].map(
+            lambda s: 1 if outcome_labels.get(s, {}).get("won") == "UP"
+            else (0 if outcome_labels.get(s, {}).get("won") == "DOWN" else np.nan)
+        )
+        valid_mask = df["_outcome"].notna()
+        if valid_mask.sum() < len(df):
+            n_drop = len(df) - valid_mask.sum()
+            print(f"  排除 {n_drop} 笔无结算数据的交易 ({n_drop/len(df)*100:.1f}%)")
+            X = X[valid_mask].reset_index(drop=True)
+            groups = groups[valid_mask].reset_index(drop=True)
+            df = df[valid_mask].reset_index(drop=True)
+        y = df["_outcome"].astype(int)
+        n_up_win = (y == 1).sum()
+        n_dn_win = (y == 0).sum()
+        print(f"  标签分布: UP赢={n_up_win} ({n_up_win/len(y)*100:.1f}%) | DOWN赢={n_dn_win} ({n_dn_win/len(y)*100:.1f}%)")
+    else:
+        y = (df["side"] == "UP").astype(int)       # 1=UP, 0=DOWN
 
     # 特征覆盖率
     coverage = X.notna().mean().sort_values()
@@ -485,6 +535,8 @@ def train_signal_model(df: pd.DataFrame, threshold: float = 0.60,
         "feature_importance": imp,
         "features_used": features,
         "label": label,
+        "training_mode": training_mode,
+        "df_used": df,  # 训练时实际使用的 df (可能已过滤)
     }
 
 
@@ -614,78 +666,188 @@ def backtest_signals(df: pd.DataFrame, probs: np.ndarray, threshold: float):
 
 
 # ══════════════════════════════════════════════════════════════
-# 6. 连接 settlements 进行盈亏验证
+# 6. 窗口 PnL 模拟 (核心评估)
 # ══════════════════════════════════════════════════════════════
 
-def validate_with_settlements(df: pd.DataFrame, probs: np.ndarray, threshold: float):
-    """将模型信号与实际结算结果对比, 估算信号的盈亏价值"""
+def simulate_window_pnl(df: pd.DataFrame, probs: np.ndarray, threshold: float,
+                        settle: dict, bet_mode: str = "fixed",
+                        base_bet: float = 10.0):
+    """
+    ⭐ 核心评估: 按模型信号在每个5分钟窗口内下注, 结算后计算真实PnL.
+
+    流程:
+      1. 遍历每个窗口内的决策点
+      2. 模型输出 UP/DOWN/HOLD → 有信号则按方向下注
+      3. 窗口结算: 赢方 shares × $1 = payout
+      4. PnL = payout - total_cost
+
+    bet_mode:
+      "fixed"      — 每次信号固定 base_bet 下注 (纯方向预测评估)
+      "confidence" — 按模型置信度缩放: base_bet × (conf - 0.5) / 0.5
+                     置信度越高下注越大, 刚过阈值只下一点点
+    """
+    mode_desc = f"{bet_mode} (${base_bet:.0f}/笔)" if bet_mode == "fixed" else f"{bet_mode} (基础${base_bet:.0f})"
     print("\n" + "=" * 72)
-    print("  盈亏验证: 模型信号 vs 真实结算")
+    print(f"  ⭐ 窗口 PnL 模拟 (阈值={threshold:.2f}, 下注={mode_desc})")
     print("=" * 72)
 
-    conn = sqlite3.connect(str(DB_PATH))
-    settle_rows = conn.execute(
-        "SELECT slug, pnl, won, up_cost, dn_cost, up_shares, dn_shares "
-        "FROM settlements ORDER BY settled_at"
-    ).fetchall()
-    conn.close()
-
-    if not settle_rows:
+    if not settle:
         print("  无结算数据, 跳过")
-        return
-
-    settle = {}
-    for slug, pnl, won, u_cost, d_cost, u_sh, d_sh in settle_rows:
-        settle[slug] = {
-            "pnl": pnl, "won": won,
-            "up_cost": u_cost or 0, "dn_cost": d_cost or 0,
-            "up_shares": u_sh or 0, "dn_shares": d_sh or 0,
-        }
+        return None
 
     valid = ~np.isnan(probs)
     df_v = df[valid].copy()
-    df_v["prob_up"] = probs[valid]
+    p_v = probs[valid]
+
+    df_v["prob_up"] = p_v
     df_v["signal"] = "HOLD"
     df_v.loc[df_v.prob_up > threshold, "signal"] = "UP"
     df_v.loc[df_v.prob_up < (1 - threshold), "signal"] = "DOWN"
 
-    # 按窗口汇总信号
-    win_signals = {}
+    # ── 逐窗口模拟 ──
+    window_results = []
     for slug, grp in df_v.groupby("slug"):
-        sig = grp[grp.signal != "HOLD"]
-        if len(sig) == 0:
-            continue
-        up_usdc = sig[sig.signal == "UP"].usdc.sum()
-        dn_usdc = sig[sig.signal == "DOWN"].usdc.sum()
-        # 模型推荐的主方向
-        if up_usdc > dn_usdc:
-            bias = "UP"
-        elif dn_usdc > up_usdc:
-            bias = "DOWN"
-        else:
-            bias = "NEUTRAL"
-        win_signals[slug] = {"bias": bias, "up_usdc": up_usdc, "dn_usdc": dn_usdc}
-
-    # 对比结算
-    correct_pnl = 0
-    wrong_pnl = 0
-    total_checked = 0
-    for slug, sig_info in win_signals.items():
         if slug not in settle:
             continue
-        s = settle[slug]
-        won_side = s["won"]
-        total_checked += 1
+        won = settle[slug]["won"]
+        if won not in ("UP", "DOWN"):
+            continue
 
-        if sig_info["bias"] == won_side:
-            correct_pnl += s["pnl"]
-        elif sig_info["bias"] != "NEUTRAL":
-            wrong_pnl += s["pnl"]
+        up_shares = 0.0
+        dn_shares = 0.0
+        up_cost = 0.0
+        dn_cost = 0.0
+        n_signals = 0
 
-    print(f"\n可匹配窗口: {total_checked}")
-    if total_checked > 0:
-        print(f"  模型偏向正确时的窗口 PnL: ${correct_pnl:.2f}")
-        print(f"  模型偏向错误时的窗口 PnL: ${wrong_pnl:.2f}")
+        for _, row in grp.iterrows():
+            sig = row["signal"]
+            if sig == "HOLD":
+                continue
+
+            n_signals += 1
+            # 下注金额
+            prob = row["prob_up"]
+            conf = max(prob, 1 - prob)  # 置信度 [0.5, 1.0]
+            if bet_mode == "confidence":
+                # 置信度线性缩放: conf=阈值时→小注, conf=1.0时→2×base_bet
+                # scale 范围: [0, 2] (阈值处≈0, 满置信度=2x)
+                scale = (conf - threshold) / (1.0 - threshold) * 2.0 if conf > threshold else 0
+                bet = base_bet * max(scale, 0.1)  # 最少 10% base_bet
+            else:
+                bet = base_bet
+
+            if sig == "UP":
+                price = row.get("up_ask", np.nan)
+                if pd.isna(price) or price <= 0 or price >= 1:
+                    price = 0.55  # fallback
+                shares = bet / price
+                up_shares += shares
+                up_cost += bet
+            else:  # DOWN
+                price = row.get("dn_ask", np.nan)
+                if pd.isna(price) or price <= 0 or price >= 1:
+                    price = 0.55
+                shares = bet / price
+                dn_shares += shares
+                dn_cost += bet
+
+        total_cost = up_cost + dn_cost
+        if total_cost == 0:
+            continue
+
+        # 结算: 赢方 shares 各兑 $1
+        if won == "UP":
+            payout = up_shares * 1.0
+        else:  # DOWN
+            payout = dn_shares * 1.0
+
+        pnl = payout - total_cost
+
+        window_results.append({
+            "slug": slug,
+            "won": won,
+            "up_shares": round(up_shares, 2),
+            "dn_shares": round(dn_shares, 2),
+            "up_cost": round(up_cost, 2),
+            "dn_cost": round(dn_cost, 2),
+            "total_cost": round(total_cost, 2),
+            "payout": round(payout, 2),
+            "pnl": round(pnl, 2),
+            "n_signals": n_signals,
+            "roi": pnl / total_cost if total_cost > 0 else 0,
+            "0x1d_pnl": settle[slug]["pnl"],
+        })
+
+    if not window_results:
+        print("  无可匹配的窗口")
+        return None
+
+    wr = pd.DataFrame(window_results)
+
+    # ── 汇总统计 ──
+    total_pnl = wr.pnl.sum()
+    total_cost = wr.total_cost.sum()
+    total_payout = wr.payout.sum()
+    win_rate = (wr.pnl > 0).mean()
+    avg_pnl = wr.pnl.mean()
+    median_pnl = wr.pnl.median()
+    total_roi = total_pnl / total_cost if total_cost > 0 else 0
+    actual_total_pnl = wr["0x1d_pnl"].sum()
+
+    print(f"\n  模拟窗口数: {len(wr)}")
+    print(f"  {'─' * 50}")
+    print(f"  总投入:       ${total_cost:>12,.2f}")
+    print(f"  总回收:       ${total_payout:>12,.2f}")
+    print(f"  总 PnL:       ${total_pnl:>12,.2f}  (ROI: {total_roi:>+.2%})")
+    print(f"  {'─' * 50}")
+    print(f"  窗口胜率:     {win_rate:.2%} ({(wr.pnl > 0).sum()}/{len(wr)})")
+    print(f"  平均 PnL:     ${avg_pnl:>+.2f}/窗口")
+    print(f"  中位数 PnL:   ${median_pnl:>+.2f}/窗口")
+    print(f"  最大盈利:     ${wr.pnl.max():>+.2f}")
+    print(f"  最大亏损:     ${wr.pnl.min():>+.2f}")
+
+    # 盈利/亏损窗口分别分析
+    wins = wr[wr.pnl > 0]
+    losses = wr[wr.pnl <= 0]
+    if len(wins) > 0 and len(losses) > 0:
+        avg_win = wins.pnl.mean()
+        avg_loss = losses.pnl.mean()
+        profit_factor = wins.pnl.sum() / abs(losses.pnl.sum()) if losses.pnl.sum() != 0 else float('inf')
+        print(f"  {'─' * 50}")
+        print(f"  盈利窗口均值: ${avg_win:>+.2f}  |  亏损窗口均值: ${avg_loss:>+.2f}")
+        print(f"  盈亏比:       {profit_factor:.2f}")
+
+    # ── 与 0x1d 真实 PnL 对比 ──
+    print(f"\n  ── 与 0x1d 实际对比 ──")
+    print(f"  0x1d 总 PnL:  ${actual_total_pnl:>12,.2f}")
+    print(f"  模型总 PnL:   ${total_pnl:>12,.2f}")
+    diff = total_pnl - actual_total_pnl
+    print(f"  差异:         ${diff:>+12,.2f} ({'模型更优' if diff > 0 else '0x1d更优'})")
+
+    # ── Top/Bottom 窗口明细 ──
+    wr_sorted = wr.sort_values("pnl", ascending=False)
+    print(f"\n  盈利最多 (Top 5):")
+    for _, row in wr_sorted.head(5).iterrows():
+        short = row.slug.split("-")[-1] if "-" in str(row.slug) else str(row.slug)
+        bias = "UP" if row.up_cost > row.dn_cost else "DOWN"
+        print(f"    {short}: PnL=${row.pnl:>+.2f} 下注${row.total_cost:.0f} "
+              f"方向={bias} 赢方={row.won} 0x1d=${row['0x1d_pnl']:>+.2f}")
+    print(f"  亏损最多 (Bottom 5):")
+    for _, row in wr_sorted.tail(5).iterrows():
+        short = row.slug.split("-")[-1] if "-" in str(row.slug) else str(row.slug)
+        bias = "UP" if row.up_cost > row.dn_cost else "DOWN"
+        print(f"    {short}: PnL=${row.pnl:>+.2f} 下注${row.total_cost:.0f} "
+              f"方向={bias} 赢方={row.won} 0x1d=${row['0x1d_pnl']:>+.2f}")
+
+    return {
+        "total_pnl": total_pnl,
+        "total_roi": total_roi,
+        "win_rate": win_rate,
+        "avg_pnl": avg_pnl,
+        "n_windows": len(wr),
+        "actual_pnl": actual_total_pnl,
+        "window_df": wr,
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -721,6 +883,7 @@ def save_model(model, eval_results: dict, threshold: float):
         "n_features": len(features_used),
         "model_type": model_label,
         "pure_market": "持仓" not in model_label,
+        "training_label": eval_results.get("training_mode", "mimicry"),
         "excluded_features": EXCLUDED,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -772,6 +935,7 @@ def main():
     rich_only = "--rich-only" in sys.argv
     pure_market = "--pure-market" in sys.argv
     compare_mode = "--compare" in sys.argv
+    outcome_mode = "--outcome" in sys.argv
     threshold = 0.60
     for i, arg in enumerate(sys.argv):
         if arg == "--threshold" and i + 1 < len(sys.argv):
@@ -779,17 +943,25 @@ def main():
 
     print("=" * 72)
     print("  0x1d 实时信号蒸馏 — Real-time Entry Signal Model")
-    print("  目标: 学习 0x1d 的入场时机和方向, 实时输出 UP/DOWN/HOLD")
+    if outcome_mode:
+        print("  目标: 预测窗口结算赢方, 以 PnL 为核心评估指标")
+    else:
+        print("  目标: 学习 0x1d 的入场时机和方向, 实时输出 UP/DOWN/HOLD")
     print("=" * 72)
     if rich_only:
         print("  [模式] 仅使用有 ref_ts 的高质量数据")
     if pure_market:
         print("  [模式] 纯市场特征 (排除持仓/行为/burst 自相关特征)")
+    if outcome_mode:
+        print("  [模式] 结算标签 (训练目标=窗口赢方, 而非模仿0x1d)")
     if compare_mode:
         print("  [模式] 对比: 全特征 vs 纯市场特征")
 
     # ── 加载数据 ──
     df = load_trades(rich_only=rich_only)
+
+    # ── 加载结算数据 (PnL 评估 + outcome 标签) ──
+    settle = load_settlement_labels()
 
     # ── 突发聚类 ──
     df = deduplicate_bursts(df)
@@ -801,19 +973,26 @@ def main():
         print("\n[--report 模式, 跳过训练]")
         return
 
+    # outcome 模式的标签
+    outcome_labels = settle if outcome_mode else None
+
     # ── 对比模式: 同时训练两个模型 ──
     if compare_mode:
         print("\n" + "#" * 72)
         print("#  对比模式: 全特征 vs 纯市场特征")
+        if outcome_mode:
+            print("#  训练标签: 窗口结算结果")
         print("#" * 72)
 
         m_all, r_all = train_signal_model(
             df, threshold=threshold,
-            feature_set=SIGNAL_FEATURES, label="全特征(含持仓)"
+            feature_set=SIGNAL_FEATURES, label="全特征(含持仓)",
+            outcome_labels=outcome_labels,
         )
         m_pure, r_pure = train_signal_model(
             df, threshold=threshold,
-            feature_set=PURE_MARKET_FEATURES, label="纯市场特征"
+            feature_set=PURE_MARKET_FEATURES, label="纯市场特征",
+            outcome_labels=outcome_labels,
         )
 
         # 对比汇总
@@ -839,6 +1018,23 @@ def main():
         for _, row in r_pure["feature_importance"].head(10).iterrows():
             print(f"    {row['feature']:<32} {row['importance']:>6.0f}")
 
+        # PnL 模拟对比
+        print("\n" + "#" * 72)
+        print("#  PnL 模拟对比")
+        print("#" * 72)
+        df_all = r_all.get("df_used", df)
+        df_pure = r_pure.get("df_used", df)
+        pnl_all = simulate_window_pnl(df_all, r_all["all_probs"], r_all["best_threshold"], settle, "fixed")
+        pnl_pure = simulate_window_pnl(df_pure, r_pure["all_probs"], r_pure["best_threshold"], settle, "fixed")
+
+        if pnl_all and pnl_pure:
+            print(f"\n  ── PnL 对比总结 (fixed $10/信号) ──")
+            print(f"  {'指标':<16} {'全特征':>16} {'纯市场':>16}")
+            print(f"  {'-' * 48}")
+            print(f"  {'总 PnL':<14} ${pnl_all['total_pnl']:>+14,.2f} ${pnl_pure['total_pnl']:>+14,.2f}")
+            print(f"  {'ROI':<14} {pnl_all['total_roi']:>+15.2%} {pnl_pure['total_roi']:>+15.2%}")
+            print(f"  {'窗口胜率':<12} {pnl_all['win_rate']:>15.2%} {pnl_pure['win_rate']:>15.2%}")
+
         print(f"\n  结论:")
         if r_pure["cv_acc"] >= r_all["cv_acc"] - 0.01:
             print(f"  ✓ 纯市场特征效果相当或更好 — 持仓特征是噪声/自相关, 可安全移除")
@@ -854,23 +1050,28 @@ def main():
         return
 
     # ── 常规训练 ──
-    if pure_market:
+    if pure_market or outcome_mode:
         features = PURE_MARKET_FEATURES
         label = "纯市场特征"
+        if outcome_mode and not pure_market:
+            print("  [自动] --outcome 模式默认使用纯市场特征 (避免泄漏)")
     else:
         features = SIGNAL_FEATURES
         label = "全特征(含持仓)"
 
     model, eval_results = train_signal_model(
-        df, threshold=threshold, feature_set=features, label=label
+        df, threshold=threshold, feature_set=features, label=label,
+        outcome_labels=outcome_labels,
     )
 
-    # ── 信号回测 ──
+    # ── 信号回测 (方向准确率, 辅助参考) ──
     best_t = eval_results.get("best_threshold", threshold)
-    backtest_signals(df, eval_results["all_probs"], best_t)
+    df_used = eval_results.get("df_used", df)
+    backtest_signals(df_used, eval_results["all_probs"], best_t)
 
-    # ── 盈亏验证 ──
-    validate_with_settlements(df, eval_results["all_probs"], best_t)
+    # ── ⭐ PnL 模拟 (核心评估) ──
+    pnl_fixed = simulate_window_pnl(df_used, eval_results["all_probs"], best_t, settle, "fixed")
+    pnl_conf = simulate_window_pnl(df_used, eval_results["all_probs"], best_t, settle, "confidence")
 
     # ── 保存 ──
     save_model(model, eval_results, best_t)
@@ -879,20 +1080,33 @@ def main():
     print("\n" + "=" * 72)
     print("  训练完成!")
     print(f"  模式:      {label}")
+    print(f"  训练标签:  {'窗口结算结果 (outcome)' if outcome_mode else '模仿0x1d方向 (mimicry)'}")
     print(f"  CV 准确率: {eval_results['cv_acc']:.4f} (随机基准: 0.5000)")
     print(f"  CV AUC:    {eval_results['cv_auc']:.4f}")
     print(f"  最佳阈值:  {best_t:.2f}")
+    if pnl_fixed:
+        print(f"  ── PnL 核心指标 (fixed $10/笔) ──")
+        print(f"  模型 PnL:  ${pnl_fixed['total_pnl']:>+,.2f} (ROI: {pnl_fixed['total_roi']:>+.2%})")
+        print(f"  窗口胜率:  {pnl_fixed['win_rate']:.2%}")
+        print(f"  0x1d PnL:  ${pnl_fixed['actual_pnl']:>+,.2f}")
+    if pnl_conf:
+        print(f"  ── PnL 核心指标 (confidence缩放) ──")
+        print(f"  模型 PnL:  ${pnl_conf['total_pnl']:>+,.2f} (ROI: {pnl_conf['total_roi']:>+.2%})")
+        print(f"  窗口胜率:  {pnl_conf['win_rate']:.2%}")
+    print(f"  {'─' * 50}")
     print(f"  信号逻辑:  P(UP) > {best_t:.2f} → 买UP")
     print(f"              P(UP) < {1-best_t:.2f} → 买DOWN")
     print(f"              其余 → HOLD (不交易)")
     print("=" * 72)
-    if not pure_market:
+    if not pure_market and not outcome_mode:
         print("\n  ⚠ 注意: 当前使用全特征(含持仓), Top特征可能是自相关而非市场信号")
-        print("  建议运行: python scripts/distill_signal.py --compare")
-        print("  或直接:   python scripts/distill_signal.py --pure-market")
+        print("  建议运行: python scripts/distill_signal.py --outcome --pure-market")
+    if not outcome_mode:
+        print("\n  💡 推荐: 使用 --outcome 模式, 以窗口盈亏为训练目标:")
+        print("     python scripts/distill_signal.py --outcome --rich-only")
     print("\n  下一步:")
     print("  1. 让 monitor_0x1d.py 持续运行收集更多数据 (目标: 7天+)")
-    print("  2. 数据增加后重新训练: python scripts/distill_signal.py --pure-market")
+    print("  2. 推荐训练命令: python scripts/distill_signal.py --outcome --rich-only")
     print("  3. 将模型集成到交易机器人, 替代手工规则")
 
 
