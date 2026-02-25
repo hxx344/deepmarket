@@ -47,3 +47,5 @@ test_rtds.py
 
 # diskcache
 cache/
+
+distill_report*.txt
