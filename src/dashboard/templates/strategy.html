@@ -1,26 +1,23 @@
 {% extends "base.html" %}
 {% block title %}策略中心{% endblock %}
-{% block page_title %}策略中心 — BN-RTDS Spread{% endblock %}
+{% block page_title %}策略中心 — Tail Reversal{% endblock %}
 
 {% block head %}
-<!-- Chart.js for BTC price chart (与监控面板一致) -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<!-- ECharts for deviation chart -->
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 {% endblock %}
 
 {% block content %}
 <div class="space-y-5" x-data="strategyPage()" x-init="init()">
 
-  <!-- ═══ 1. BN-RTDS 价差仪表 ═══ -->
+  <!-- ═══ 1. 窗口状态 & 入场条件 ═══ -->
   <div class="card">
     <div class="flex items-center justify-between mb-4">
       <div class="flex items-center gap-3">
-        <h3 class="text-sm font-semibold text-gray-300">BN-RTDS Direction Conviction</h3>
-        <span class="badge badge-blue text-[10px]">v<span x-text="stratVersion">2.0</span></span>
+        <h3 class="text-sm font-semibold text-gray-300">Tail Reversal</h3>
+        <span class="badge badge-blue text-[10px]">v<span x-text="stratVersion">1.0</span></span>
         <span class="badge text-[10px]"
-              :class="{'badge-green': signalState === 'COMMITTED_UP', 'badge-red': signalState === 'COMMITTED_DOWN', 'badge-yellow': signalState === 'IDLE'}"
-              x-text="signalState">IDLE</span>
+              :class="{'badge-green': entryZone === 'ACTIVE', 'badge-yellow': entryZone === 'WAIT', 'badge-red': entryZone === 'CUTOFF'}"
+              x-text="entryZone">WAIT</span>
       </div>
       <div class="flex items-center gap-3 text-xs">
         <span class="text-gray-400">模式</span>
@@ -30,71 +27,76 @@
       </div>
     </div>
 
-    <!-- 双价格源 -->
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
-      <div class="bg-surface-3 rounded-lg p-3 text-center">
-        <p class="stat-label">Binance BTC</p>
-        <p class="stat-value text-white !text-lg font-mono" x-text="'$' + binancePrice.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</p>
-      </div>
+    <!-- 核心指标 -->
+    <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-4">
       <div class="bg-surface-3 rounded-lg p-3 text-center">
         <p class="stat-label">RTDS (Chainlink)</p>
         <p class="stat-value text-white !text-lg font-mono" x-text="'$' + rtdsPrice.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
-        <p class="stat-label">Spread (BN-RTDS)</p>
-        <p class="stat-value !text-lg font-mono"
-           :class="spread >= 0 ? 'text-up' : 'text-down'"
-           x-text="(spread >= 0 ? '+' : '') + '$' + Math.abs(spread).toFixed(2)">$0.00</p>
+        <p class="stat-label">PTB (基准价)</p>
+        <p class="stat-value text-yellow-400 !text-lg font-mono" x-text="'$' + windowPtb.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
-        <p class="stat-label">Deviation</p>
+        <p class="stat-label">偏离 PTB</p>
         <p class="stat-value !text-lg font-mono"
            :class="deviation >= 0 ? 'text-up' : 'text-down'"
-           x-text="(deviation >= 0 ? '+' : '') + '$' + Math.abs(deviation).toFixed(3)">$0.000</p>
+           x-text="(deviation >= 0 ? '+' : '') + '$' + Math.abs(deviation).toFixed(2)">$0.00</p>
+      </div>
+      <div class="bg-surface-3 rounded-lg p-3 text-center">
+        <p class="stat-label">便宜侧</p>
+        <p class="stat-value !text-lg font-bold"
+           :class="cheapSide === 'UP' ? 'text-up' : 'text-down'"
+           x-text="cheapSide + ' @' + cheapAsk.toFixed(2)">—</p>
+      </div>
+      <div class="bg-surface-3 rounded-lg p-3 text-center">
+        <p class="stat-label">BTC 波动(30s)</p>
+        <p class="stat-value !text-lg font-mono text-brand-500" x-text="'$' + btcVol30s.toFixed(2)">$0.00</p>
       </div>
     </div>
 
-    <!-- Deviation 指示条 -->
-    <div class="mb-1 flex items-center justify-between text-xs text-gray-400">
-      <span>← DOWN (BN领跌)</span>
-      <span class="font-mono text-white text-sm" x-text="(deviation >= 0 ? '+' : '') + deviation.toFixed(3)">0.000</span>
-      <span>(BN领涨) UP →</span>
-    </div>
-    <div class="relative h-4 bg-surface-3 rounded-full overflow-hidden">
-      <div class="absolute left-1/2 top-0 w-px h-full bg-gray-500 z-10"></div>
-      <!-- 阈值标记 -->
-      <div class="absolute top-0 h-full w-px bg-yellow-600/60 z-10"
-           :style="'left:' + deviationBarPos(openThreshold) + '%'"></div>
-      <div class="absolute top-0 h-full w-px bg-yellow-600/60 z-10"
-           :style="'left:' + deviationBarPos(-openThreshold) + '%'"></div>
-      <!-- Deviation 填充 -->
-      <div class="absolute top-0 h-full transition-all duration-300 rounded-full"
-           :class="deviation >= 0 ? 'bg-green-500/80' : 'bg-red-500/80'"
-           :style="deviation >= 0
-             ? 'left:50%; width:' + Math.min(50, Math.abs(deviation) / deviationScale * 50) + '%'
-             : 'right:50%; width:' + Math.min(50, Math.abs(deviation) / deviationScale * 50) + '%'">
+    <!-- 窗口进度条 -->
+    <div class="mb-2">
+      <div class="flex items-center justify-between text-xs text-gray-400 mb-1">
+        <span>窗口进度</span>
+        <span class="font-mono text-white" x-text="elapsedPct.toFixed(1) + '% — ' + formatCountdown(secsLeft) + ' left'"></span>
+      </div>
+      <div class="relative h-4 bg-surface-3 rounded-full overflow-hidden">
+        <!-- 入场区间标记 -->
+        <div class="absolute top-0 h-full bg-yellow-500/20 z-0"
+             :style="'left:' + entryStartPct + '%; width:' + (entryCutoffPct - entryStartPct) + '%'"></div>
+        <!-- 进度 -->
+        <div class="absolute top-0 h-full transition-all duration-500 rounded-full z-10"
+             :class="entryZone === 'ACTIVE' ? 'bg-green-500/80' : entryZone === 'CUTOFF' ? 'bg-red-500/60' : 'bg-brand-600/60'"
+             :style="'width:' + elapsedPct + '%'"></div>
+      </div>
+      <div class="flex justify-between text-[10px] text-gray-500 mt-0.5">
+        <span>0%</span>
+        <span :style="'margin-left:' + (entryStartPct - 5) + '%'" class="text-yellow-500">入场开始 (<span x-text="entryStartPct"></span>%)</span>
+        <span class="text-red-500">截止 (<span x-text="entryCutoffPct"></span>%)</span>
+        <span>100%</span>
       </div>
     </div>
 
-    <!-- EMA 数据行 -->
-    <div class="grid grid-cols-2 gap-4 mt-3">
+    <!-- PM 价格 -->
+    <div class="grid grid-cols-2 gap-3 mt-3">
       <div class="flex items-center justify-between bg-surface-3 rounded-lg px-3 py-2">
-        <span class="text-xs text-gray-400">Spread EMA Fast (3s)</span>
-        <span class="font-mono text-sm" :class="spreadEmaFast >= 0 ? 'text-up' : 'text-down'"
-              x-text="(spreadEmaFast >= 0 ? '+' : '') + spreadEmaFast.toFixed(3)">0.000</span>
+        <span class="text-xs text-gray-400">UP Ask</span>
+        <span class="font-mono text-sm" :class="upAsk <= 0.01 ? 'text-green-400 font-bold' : 'text-gray-200'"
+              x-text="'¢' + (upAsk * 100).toFixed(1)">¢0.0</span>
       </div>
       <div class="flex items-center justify-between bg-surface-3 rounded-lg px-3 py-2">
-        <span class="text-xs text-gray-400">Spread EMA Slow (30s)</span>
-        <span class="font-mono text-sm" :class="spreadEmaSlow >= 0 ? 'text-up' : 'text-down'"
-              x-text="(spreadEmaSlow >= 0 ? '+' : '') + spreadEmaSlow.toFixed(3)">0.000</span>
+        <span class="text-xs text-gray-400">DOWN Ask</span>
+        <span class="font-mono text-sm" :class="dnAsk <= 0.01 ? 'text-green-400 font-bold' : 'text-gray-200'"
+              x-text="'¢' + (dnAsk * 100).toFixed(1)">¢0.0</span>
       </div>
     </div>
   </div>
 
-  <!-- ═══ 2. BTC 行情对比 (与监控面板一致) ═══ -->
+  <!-- ═══ 2. BTC Tick 图 ═══ -->
   <div class="card">
     <div class="flex items-center justify-between mb-4">
-      <h3 class="text-sm font-semibold text-gray-300">BTC 行情对比 (<span class="text-[#58a6ff]">CHAINLINK</span>)</h3>
+      <h3 class="text-sm font-semibold text-gray-300">BTC 行情 (<span class="text-[#58a6ff]">CHAINLINK</span>)</h3>
       <span class="font-mono text-white text-lg font-bold" x-text="'$' + rtdsPrice.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})">$0.00</span>
     </div>
     <div style="position:relative; height:260px;">
@@ -102,205 +104,76 @@
     </div>
   </div>
 
-  <!-- ═══ 2b. Deviation 实时图表 ═══ -->
-  <div class="card">
-    <div class="flex items-center justify-between mb-2">
-      <h3 class="text-sm font-semibold text-gray-300">Deviation 实时走势 & 入场点位</h3>
-      <span class="text-xs text-gray-500" x-text="'数据点: ' + deviationHistory.length"></span>
-    </div>
-    <div id="deviation-chart" style="width:100%; height:260px;"></div>
-  </div>
-
-  <!-- ═══ 3. 双边持仓 & 建仓进度 ═══ -->
+  <!-- ═══ 3. 当前窗口下注 & 绩效 ═══ -->
   <div class="grid grid-cols-2 gap-5">
-    <!-- 双边持仓 -->
+    <!-- 下注状态 -->
     <div class="card">
-      <div class="flex items-center justify-between mb-3">
-        <h3 class="text-sm font-semibold text-gray-300">双边持仓</h3>
-        <template x-if="hasPosition">
-          <span class="badge badge-yellow text-[10px]"
-                x-text="'GAP ' + sharesGap.toFixed(1) + 'sh (' + sharesGapPct.toFixed(0) + '%)'"></span>
-        </template>
-      </div>
-      <template x-if="!hasPosition">
-        <p class="text-gray-500 text-sm py-6 text-center">无持仓 — 等待 Deviation 偏离信号</p>
-      </template>
-      <template x-if="hasPosition">
-        <div class="space-y-3">
-          <!-- 建仓进度条 -->
-          <div>
-            <div class="flex justify-between text-[10px] text-gray-400 mb-1">
-              <span>UP 建仓进度</span>
-              <span x-text="upProgressPct.toFixed(0) + '%'"></span>
-            </div>
-            <div class="h-2 bg-surface-1 rounded-full overflow-hidden">
-              <div class="h-full bg-green-500/70 rounded-full transition-all duration-500"
-                   :style="'width:' + upProgressPct + '%'"></div>
-            </div>
-          </div>
-          <div>
-            <div class="flex justify-between text-[10px] text-gray-400 mb-1">
-              <span>DN 建仓进度</span>
-              <span x-text="dnProgressPct.toFixed(0) + '%'"></span>
-            </div>
-            <div class="h-2 bg-surface-1 rounded-full overflow-hidden">
-              <div class="h-full bg-red-500/70 rounded-full transition-all duration-500"
-                   :style="'width:' + dnProgressPct + '%'"></div>
-            </div>
-          </div>
-
-          <!-- UP 侧 -->
-          <div class="bg-surface-3 rounded-lg p-2.5">
-            <div class="flex items-center gap-2 mb-2">
-              <span class="text-green-400 font-bold text-xs">▲ UP</span>
-              <template x-if="upPos">
-                <span class="text-[10px] text-gray-400" x-text="upPos.shares?.toFixed(1) + ' sh / ' + upPos.entries + ' entries'"></span>
-              </template>
-            </div>
-            <template x-if="upPos">
-              <div class="grid grid-cols-3 gap-2 text-xs">
-                <div>
-                  <p class="text-[10px] text-gray-500">Avg Ask</p>
-                  <p class="font-mono text-white" x-text="'¢' + (upPos.entry_price * 100).toFixed(1)"></p>
-                </div>
-                <div>
-                  <p class="text-[10px] text-gray-500">投入</p>
-                  <p class="font-mono text-white" x-text="'$' + upPos.size.toFixed(2)"></p>
-                </div>
-                <div>
-                  <p class="text-[10px] text-gray-500">浮动</p>
-                  <p class="font-mono" :class="(upPos.unrealized_pnl||0) >= 0 ? 'text-up' : 'text-down'"
-                     x-text="((upPos.unrealized_pnl||0) >= 0 ? '+' : '') + '$' + Math.abs(upPos.unrealized_pnl||0).toFixed(4)"></p>
-                </div>
-              </div>
-            </template>
-            <template x-if="!upPos">
-              <p class="text-gray-600 text-xs">—</p>
-            </template>
-          </div>
-
-          <!-- DOWN 侧 -->
-          <div class="bg-surface-3 rounded-lg p-2.5">
-            <div class="flex items-center gap-2 mb-2">
-              <span class="text-red-400 font-bold text-xs">▼ DOWN</span>
-              <template x-if="dnPos">
-                <span class="text-[10px] text-gray-400" x-text="dnPos.shares?.toFixed(1) + ' sh / ' + dnPos.entries + ' entries'"></span>
-              </template>
-            </div>
-            <template x-if="dnPos">
-              <div class="grid grid-cols-3 gap-2 text-xs">
-                <div>
-                  <p class="text-[10px] text-gray-500">Avg Ask</p>
-                  <p class="font-mono text-white" x-text="'¢' + (dnPos.entry_price * 100).toFixed(1)"></p>
-                </div>
-                <div>
-                  <p class="text-[10px] text-gray-500">投入</p>
-                  <p class="font-mono text-white" x-text="'$' + dnPos.size.toFixed(2)"></p>
-                </div>
-                <div>
-                  <p class="text-[10px] text-gray-500">浮动</p>
-                  <p class="font-mono" :class="(dnPos.unrealized_pnl||0) >= 0 ? 'text-up' : 'text-down'"
-                     x-text="((dnPos.unrealized_pnl||0) >= 0 ? '+' : '') + '$' + Math.abs(dnPos.unrealized_pnl||0).toFixed(4)"></p>
-                </div>
-              </div>
-            </template>
-            <template x-if="!dnPos">
-              <p class="text-gray-600 text-xs">—</p>
-            </template>
-          </div>
-
-          <!-- 合计 -->
-          <div class="flex justify-between text-xs border-t border-gray-700/30 pt-2">
-            <span class="text-gray-400">双边合计</span>
-            <span class="font-mono text-white" x-text="'$' + (position?.size || 0).toFixed(2)"></span>
-            <span class="font-mono font-bold"
-                  :class="(position?.unrealized_pnl || 0) >= 0 ? 'text-up' : 'text-down'"
-                  x-text="((position?.unrealized_pnl || 0) >= 0 ? '+' : '') + '$' + Math.abs(position?.unrealized_pnl || 0).toFixed(4)"></span>
-          </div>
-        </div>
-      </template>
-    </div>
-
-    <!-- 窗口统计 & 信号分布 -->
-    <div class="card">
-      <h3 class="text-sm font-semibold text-gray-300 mb-3">窗口统计</h3>
+      <h3 class="text-sm font-semibold text-gray-300 mb-3">当前窗口</h3>
       <div class="grid grid-cols-2 gap-3 text-center">
         <div class="bg-surface-3 rounded-lg p-3">
-          <p class="stat-label">当窗口入场</p>
-          <p class="stat-value text-brand-500 !text-xl" x-text="entriesThisWindow">0</p>
+          <p class="stat-label">下注次数</p>
+          <p class="stat-value text-brand-500 !text-xl">
+            <span x-text="betsThisWindow">0</span>
+            <span class="text-gray-500 text-sm">/ <span x-text="maxBetsPerWindow">3</span></span>
+          </p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
-          <p class="stat-label">窗口剩余</p>
-          <p class="stat-value !text-xl text-white font-mono" x-text="formatCountdown(pmSecondsLeft)">0:00</p>
+          <p class="stat-label">窗口投入</p>
+          <p class="stat-value font-mono !text-xl" :class="costThisWindow > 0 ? 'text-yellow-400' : 'text-gray-500'">
+            $<span x-text="costThisWindow.toFixed(2)">0.00</span>
+            <span class="text-gray-500 text-sm">/ $<span x-text="maxCostPerWindow">20</span></span>
+          </p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
-          <p class="stat-label">Conviction 交易</p>
-          <p class="stat-value text-yellow-400 !text-xl" x-text="divergeTrades">0</p>
+          <p class="stat-label">UP Shares</p>
+          <p class="stat-value text-up !text-xl font-mono" x-text="cumUpShares.toFixed(1)">0.0</p>
         </div>
         <div class="bg-surface-3 rounded-lg p-3">
-          <p class="stat-label">Hedge/Flip 交易</p>
-          <p class="stat-value text-cyan-400 !text-xl" x-text="revertTrades">0</p>
+          <p class="stat-label">DN Shares</p>
+          <p class="stat-value text-down !text-xl font-mono" x-text="cumDnShares.toFixed(1)">0.0</p>
         </div>
       </div>
-      <!-- 信号状态机 -->
-      <div class="mt-4">
-        <h4 class="text-xs font-semibold text-gray-400 mb-2">信号状态机</h4>
-        <div class="flex items-center gap-2">
-          <div class="flex-1 text-center rounded-lg py-2 text-xs font-bold transition-all"
-               :class="signalState === 'IDLE' ? 'bg-yellow-500/30 text-yellow-300 ring-1 ring-yellow-500/50' : 'bg-surface-3 text-gray-500'">
-            IDLE
-          </div>
-          <svg class="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
-          <div class="flex-1 text-center rounded-lg py-2 text-xs font-bold transition-all"
-               :class="signalState === 'COMMITTED_UP' ? 'bg-green-500/30 text-green-300 ring-1 ring-green-500/50' : 'bg-surface-3 text-gray-500'">
-            COMMITTED_UP
-          </div>
-          <svg class="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
-          <div class="flex-1 text-center rounded-lg py-2 text-xs font-bold transition-all"
-               :class="signalState === 'COMMITTED_DOWN' ? 'bg-red-500/30 text-red-300 ring-1 ring-red-500/50' : 'bg-surface-3 text-gray-500'">
-            COMMITTED_DOWN
-          </div>
+    </div>
+
+    <!-- 绩效 -->
+    <div class="card">
+      <h3 class="text-sm font-semibold text-gray-300 mb-3">累计绩效</h3>
+      <div class="grid grid-cols-2 gap-3 text-center">
+        <div class="bg-surface-3 rounded-lg p-3">
+          <p class="stat-label">累计 PnL</p>
+          <p class="stat-value !text-xl font-mono"
+             :class="cumulativePnl >= 0 ? 'text-up' : 'text-down'"
+             x-text="(cumulativePnl >= 0 ? '+$' : '-$') + Math.abs(cumulativePnl).toFixed(2)">$0.00</p>
         </div>
+        <div class="bg-surface-3 rounded-lg p-3">
+          <p class="stat-label">胜率</p>
+          <p class="stat-value !text-xl font-mono text-brand-500" x-text="winRate.toFixed(1) + '%'">0.0%</p>
+        </div>
+        <div class="bg-surface-3 rounded-lg p-3">
+          <p class="stat-label">胜/负</p>
+          <p class="stat-value !text-xl font-mono">
+            <span class="text-up" x-text="winCount">0</span>
+            <span class="text-gray-500">/</span>
+            <span class="text-down" x-text="lossCount">0</span>
+          </p>
+        </div>
+        <div class="bg-surface-3 rounded-lg p-3">
+          <p class="stat-label">总下注</p>
+          <p class="stat-value !text-xl font-mono text-white" x-text="tradeCount">0</p>
+        </div>
+      </div>
+      <!-- 账户余额 -->
+      <div class="mt-3 flex justify-between bg-surface-3 rounded-lg px-3 py-2 text-xs">
+        <span class="text-gray-400">余额</span>
+        <span class="font-mono text-white" x-text="'$' + account.balance.toFixed(2)">$0.00</span>
+        <span class="text-gray-400">可用</span>
+        <span class="font-mono" :class="account.available > 0 ? 'text-green-400' : 'text-gray-500'"
+              x-text="'$' + account.available.toFixed(2)">$0.00</span>
       </div>
     </div>
   </div>
 
-  <!-- ═══ 4. 账户 & 绩效 ═══ -->
-  <div class="card">
-    <h3 class="text-sm font-semibold text-gray-300 mb-3">账户 & 绩效</h3>
-    <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 text-center">
-      <div class="bg-surface-3 rounded-lg p-3">
-        <p class="stat-label">余额</p>
-        <p class="stat-value text-white !text-lg font-mono" x-text="'$' + account.balance.toFixed(2)">$0.00</p>
-      </div>
-      <div class="bg-surface-3 rounded-lg p-3">
-        <p class="stat-label">可用</p>
-        <p class="stat-value !text-lg font-mono"
-           :class="account.available > 0 ? 'text-green-400' : 'text-gray-500'"
-           x-text="'$' + account.available.toFixed(2)">$0.00</p>
-      </div>
-      <div class="bg-surface-3 rounded-lg p-3">
-        <p class="stat-label">累计 PnL</p>
-        <p class="stat-value !text-lg font-mono"
-           :class="cumulativePnl >= 0 ? 'text-up' : 'text-down'"
-           x-text="(cumulativePnl >= 0 ? '+$' : '-$') + Math.abs(cumulativePnl).toFixed(4)">$0.00</p>
-      </div>
-      <div class="bg-surface-3 rounded-lg p-3">
-        <p class="stat-label">胜率</p>
-        <p class="stat-value !text-lg font-mono text-brand-500" x-text="winRate.toFixed(1) + '%'">0.0%</p>
-      </div>
-      <div class="bg-surface-3 rounded-lg p-3">
-        <p class="stat-label">胜/负</p>
-        <p class="stat-value !text-lg font-mono">
-          <span class="text-up" x-text="winCount">0</span>
-          <span class="text-gray-500">/</span>
-          <span class="text-down" x-text="lossCount">0</span>
-        </p>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══ 5. 历史结算 ═══ -->
+  <!-- ═══ 4. 历史结算 ═══ -->
   <div class="card">
     <div class="flex items-center justify-between mb-3">
       <h3 class="text-sm font-semibold text-gray-300">历史结算</h3>
@@ -311,43 +184,39 @@
         <thead class="sticky top-0 bg-surface-2 z-10">
           <tr class="text-gray-400 border-b border-gray-700/50">
             <th class="py-1.5 px-2 text-left">时间</th>
-            <th class="py-1.5 px-2 text-center">胜方</th>
-            <th class="py-1.5 px-2 text-right">UP Shares</th>
-            <th class="py-1.5 px-2 text-right">DN Shares</th>
-            <th class="py-1.5 px-2 text-right">Gap</th>
-            <th class="py-1.5 px-2 text-right">投入</th>
-            <th class="py-1.5 px-2 text-right">Payout</th>
-            <th class="py-1.5 px-2 text-right">PnL</th>
             <th class="py-1.5 px-2 text-center">结果</th>
+            <th class="py-1.5 px-2 text-center">赢家</th>
+            <th class="py-1.5 px-2 text-right">投入</th>
+            <th class="py-1.5 px-2 text-right">回收</th>
+            <th class="py-1.5 px-2 text-right">PnL</th>
+            <th class="py-1.5 px-2 text-right">偏离avg</th>
             <th class="py-1.5 px-2 text-right">BTC</th>
+            <th class="py-1.5 px-2 text-right">PTB</th>
           </tr>
         </thead>
         <tbody>
           <template x-if="settlementHistory.length === 0">
-            <tr><td colspan="10" class="text-center text-gray-500 py-6">暂无结算记录</td></tr>
+            <tr><td colspan="9" class="text-center text-gray-500 py-6">暂无结算记录</td></tr>
           </template>
           <template x-for="(s, i) in settlementHistory.slice().reverse()" :key="i">
             <tr class="border-b border-gray-700/20 hover:bg-surface-3/50 transition-colors">
               <td class="py-1.5 px-2 font-mono text-gray-300" x-text="s.time || '-'"></td>
-              <td class="py-1.5 px-2 text-center font-bold"
-                  :class="s.winner === 'UP' ? 'text-up' : 'text-down'"
-                  x-text="s.winner === 'UP' ? '▲ UP' : '▼ DN'"></td>
-              <td class="py-1.5 px-2 text-right font-mono text-gray-200" x-text="(s.up_shares||0).toFixed(1)"></td>
-              <td class="py-1.5 px-2 text-right font-mono text-gray-200" x-text="(s.dn_shares||0).toFixed(1)"></td>
-              <td class="py-1.5 px-2 text-right font-mono"
-                  :class="Math.abs(s.gap_pct||0) < 10 ? 'text-green-400' : 'text-yellow-400'"
-                  x-text="(s.gap_pct||0).toFixed(0) + '%'"></td>
-              <td class="py-1.5 px-2 text-right font-mono text-gray-200" x-text="'$' + (s.size||0).toFixed(2)"></td>
-              <td class="py-1.5 px-2 text-right font-mono text-white" x-text="'$' + (s.payout||0).toFixed(2)"></td>
-              <td class="py-1.5 px-2 text-right font-mono"
-                  :class="(s.pnl||0) >= 0 ? 'text-up' : 'text-down'"
-                  x-text="((s.pnl||0) >= 0 ? '+' : '') + '$' + Math.abs(s.pnl||0).toFixed(4)"></td>
               <td class="py-1.5 px-2 text-center">
                 <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold"
                       :class="s.result === 'WIN' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'"
                       x-text="s.result"></span>
               </td>
+              <td class="py-1.5 px-2 text-center font-bold"
+                  :class="s.winner === 'UP' ? 'text-up' : 'text-down'"
+                  x-text="s.winner === 'UP' ? '▲ UP' : '▼ DN'"></td>
+              <td class="py-1.5 px-2 text-right font-mono text-gray-200" x-text="'$' + (s.size||0).toFixed(2)"></td>
+              <td class="py-1.5 px-2 text-right font-mono text-white" x-text="'$' + (s.payout||0).toFixed(2)"></td>
+              <td class="py-1.5 px-2 text-right font-mono"
+                  :class="(s.pnl||0) >= 0 ? 'text-up' : 'text-down'"
+                  x-text="((s.pnl||0) >= 0 ? '+' : '') + '$' + Math.abs(s.pnl||0).toFixed(2)"></td>
+              <td class="py-1.5 px-2 text-right font-mono text-gray-400" x-text="'$' + (s.deviation_avg||0).toFixed(2)"></td>
               <td class="py-1.5 px-2 text-right font-mono text-gray-400" x-text="'$' + (s.btc||0).toLocaleString()"></td>
+              <td class="py-1.5 px-2 text-right font-mono text-gray-400" x-text="'$' + (s.ptb||0).toLocaleString()"></td>
             </tr>
           </template>
         </tbody>
@@ -355,24 +224,24 @@
     </div>
   </div>
 
-  <!-- ═══ 6. 入场明细 ═══ -->
+  <!-- ═══ 5. 入场明细 ═══ -->
   <div class="card">
     <div class="flex items-center justify-between mb-3">
-      <h3 class="text-sm font-semibold text-gray-300">入场成交明细</h3>
-      <span class="text-xs text-gray-500" x-text="'共 ' + entryHistory.length + ' 条'"></span>
+      <h3 class="text-sm font-semibold text-gray-300">入场明细</h3>
+      <span class="text-xs text-gray-500" x-text="'共 ' + entryHistory.length + ' 笔'"></span>
     </div>
     <div class="overflow-x-auto max-h-72 overflow-y-auto">
       <table class="w-full text-xs">
         <thead class="sticky top-0 bg-surface-2 z-10">
           <tr class="text-gray-400 border-b border-gray-700/50">
             <th class="py-1.5 px-2 text-left">时间</th>
-            <th class="py-1.5 px-2 text-center">信号类型</th>
             <th class="py-1.5 px-2 text-center">方向</th>
             <th class="py-1.5 px-2 text-right">价格</th>
             <th class="py-1.5 px-2 text-right">Shares</th>
-            <th class="py-1.5 px-2 text-right">投入</th>
-            <th class="py-1.5 px-2 text-right">Deviation</th>
-            <th class="py-1.5 px-2 text-right">Gap</th>
+            <th class="py-1.5 px-2 text-right">成本</th>
+            <th class="py-1.5 px-2 text-right">赔率</th>
+            <th class="py-1.5 px-2 text-right">RTDS偏离</th>
+            <th class="py-1.5 px-2 text-right">进度</th>
             <th class="py-1.5 px-2 text-right">余额</th>
           </tr>
         </thead>
@@ -383,13 +252,6 @@
           <template x-for="(t, i) in entryHistory.slice().reverse()" :key="i">
             <tr class="border-b border-gray-700/20 hover:bg-surface-3/50 transition-colors">
               <td class="py-1.5 px-2 font-mono text-gray-300" x-text="t.time || '-'"></td>
-              <td class="py-1.5 px-2 text-center">
-                <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-bold"
-                      :class="t.signal_type === 'DIVERGE' ? 'bg-yellow-500/20 text-yellow-400'
-                            : t.signal_type === 'DIVERGE_ADD' ? 'bg-orange-500/20 text-orange-400'
-                            : 'bg-cyan-500/20 text-cyan-400'"
-                      x-text="t.signal_type || 'ENTRY'"></span>
-              </td>
               <td class="py-1.5 px-2 text-center font-bold"
                   :class="t.side === 'UP' ? 'text-up' : 'text-down'"
                   x-text="t.side === 'UP' ? '▲ UP' : '▼ DN'"></td>
@@ -398,13 +260,14 @@
               <td class="py-1.5 px-2 text-right font-mono text-gray-200"
                   x-text="(t.shares || 0).toFixed(1)"></td>
               <td class="py-1.5 px-2 text-right font-mono text-gray-200"
-                  x-text="'$' + (t.cost || t.size || 0).toFixed(2)"></td>
+                  x-text="'$' + (t.cost || 0).toFixed(2)"></td>
+              <td class="py-1.5 px-2 text-right font-mono text-yellow-400"
+                  x-text="(t.odds || 0).toFixed(0) + 'x'"></td>
               <td class="py-1.5 px-2 text-right font-mono"
                   :class="(t.deviation || 0) >= 0 ? 'text-up' : 'text-down'"
                   x-text="(t.deviation || 0) >= 0 ? '+$' + Math.abs(t.deviation||0).toFixed(2) : '-$' + Math.abs(t.deviation||0).toFixed(2)"></td>
-              <td class="py-1.5 px-2 text-right font-mono"
-                  :class="Math.abs(t.gap_shares||0) < 5 ? 'text-green-400' : 'text-yellow-400'"
-                  x-text="(t.gap_shares||0).toFixed(1) + 'sh'"></td>
+              <td class="py-1.5 px-2 text-right font-mono text-gray-400"
+                  x-text="(t.elapsed_pct || 0).toFixed(0) + '%'"></td>
               <td class="py-1.5 px-2 text-right font-mono text-gray-400"
                   x-text="t.balance_after !== undefined ? '$' + t.balance_after.toFixed(2) : '-'"></td>
             </tr>
@@ -414,14 +277,14 @@
     </div>
   </div>
 
-  <!-- ═══ 7. 策略参数 ═══ -->
+  <!-- ═══ 6. 策略参数 ═══ -->
   <div class="card">
     <h3 class="text-sm font-semibold text-gray-300 mb-3">策略参数</h3>
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-2 text-xs">
       <template x-for="[k, v] in paramEntries" :key="k">
         <div class="flex justify-between py-1 border-b border-gray-700/30">
           <span class="text-gray-400" x-text="k"></span>
-          <span class="font-mono text-gray-200" x-text="typeof v === 'number' ? v.toFixed(4) : String(v)"></span>
+          <span class="font-mono text-gray-200" x-text="typeof v === 'number' ? (v < 1 ? v.toFixed(4) : v.toFixed(2)) : String(v)"></span>
         </div>
       </template>
     </div>
@@ -433,77 +296,62 @@
 <script>
 function strategyPage() {
   return {
-    // ── Spread 数据 ──
-    binancePrice: 0,
+    // ── 市场 ──
     rtdsPrice: 0,
-    spread: 0,
-    spreadEmaFast: 0,
-    spreadEmaSlow: 0,
+    windowPtb: 0,
     deviation: 0,
-    signalState: 'IDLE',
+    cheapSide: '—',
+    cheapAsk: 0,
+    upAsk: 0,
+    dnAsk: 0,
+    btcVol30s: 0,
     stratVersion: '1.0',
-    direction: 'NEUTRAL',
-    hasSignal: false,
-    openThreshold: 2.0,   // 默认, 会被 params 覆盖
-    deviationScale: 10,   // 指示条 scale
 
-    // ── 持仓 ──
-    position: null,
-    upPos: null,
-    dnPos: null,
-    hasPosition: false,
+    // ── 窗口 ──
+    elapsedPct: 0,
+    secsLeft: 0,
+    entryZone: 'WAIT',
+    entryStartPct: 80,
+    entryCutoffPct: 95,
+
+    // ── 下注 ──
+    betsThisWindow: 0,
+    maxBetsPerWindow: 3,
+    costThisWindow: 0,
+    maxCostPerWindow: 20,
     cumUpShares: 0,
     cumDnShares: 0,
-    sharesGap: 0,
-    sharesGapPct: 0,
-    upProgressPct: 0,
-    dnProgressPct: 0,
-    entriesThisWindow: 0,
-    divergeTrades: 0,
-    revertTrades: 0,
 
     // ── 统计 ──
     tradeCount: 0,
-    paramEntries: [],
-
-    // ── 账户 & 绩效 ──
-    account: { balance: 0, available: 0, total_equity: 0, daily_pnl: 0 },
     winCount: 0,
     lossCount: 0,
     cumulativePnl: 0,
     winRate: 0,
+    paramEntries: [],
+
+    // ── 账户 ──
+    account: { balance: 0, available: 0, total_equity: 0, daily_pnl: 0 },
 
     // ── 历史 ──
-    tradeHistory: [],
     settlementHistory: [],
     entryHistory: [],
 
-    // ── 基准价 ──
-    windowPtb: 0,
-
     // ── 图表 ──
     priceHistory: [],
-    priceEntryMarkers: [],
-    deviationHistory: [],
-    entryMarkers: [],
-    _chart: null,
-    _chartMaxPoints: 1800,
     _btcIdx: 0,
+    _chartMaxPoints: 1800,
 
     init() {
       this.syncFromGlobal();
       window.addEventListener('dash:strategy', (e) => this.onStrategy(e.detail));
       window.addEventListener('dash:heartbeat', () => this.syncFromGlobal());
       window.addEventListener('dash:snapshot', () => this.syncFromGlobal());
-      this.$nextTick(() => {
-        this._initChart();
-      });
-      // Chart.js 需要延迟初始化, 等 canvas 布局完成后才能读取正确尺寸
       setTimeout(() => this._initBtcChart(), 500);
     },
 
     syncFromGlobal() {
-      const st = this.$root.__x?.$data?.strategyState || window.Alpine?.store?.('app')?.strategyState || this._getAppState()?.strategyState;
+      const st = this._getAppState()?.strategyState;
       if (st && Object.keys(st).length) this.applyState(st);
     },
 
@@ -521,49 +369,55 @@ function strategyPage() {
       if (msg && msg.data) this.applyState(msg.data);
     },
 
-    deviationBarPos(val) {
-      return 50 + (val / this.deviationScale * 50);
+    formatCountdown(secs) {
+      if (secs <= 0) return '0:00';
+      const m = Math.floor(secs / 60);
+      const s = Math.floor(secs % 60);
+      return m + ':' + String(s).padStart(2, '0');
     },
 
     applyState(st) {
-      // ── Spread 数据 ──
-      if (st.binance_price !== undefined) this.binancePrice = st.binance_price;
+      if (st.strategy_type && st.strategy_type !== 'tail_reversal') return;
+
+      // ── 市场 ──
       if (st.rtds_price !== undefined) this.rtdsPrice = st.rtds_price;
-      if (st.spread !== undefined) this.spread = st.spread;
-      if (st.spread_ema_fast !== undefined) this.spreadEmaFast = st.spread_ema_fast;
-      if (st.spread_ema_slow !== undefined) this.spreadEmaSlow = st.spread_ema_slow;
-      if (st.deviation !== undefined) this.deviation = st.deviation;
-      if (st.signal_state) this.signalState = st.signal_state;
-      if (st.version) this.stratVersion = st.version;
-      if (st.direction) this.direction = st.direction;
-      if (st.has_signal !== undefined) this.hasSignal = st.has_signal;
       if (st.window_ptb !== undefined) this.windowPtb = st.window_ptb;
+      if (st.deviation !== undefined) this.deviation = st.deviation;
+      if (st.cheap_side) this.cheapSide = st.cheap_side;
+      if (st.cheap_ask !== undefined) this.cheapAsk = st.cheap_ask;
+      if (st.up_ask !== undefined) this.upAsk = st.up_ask;
+      if (st.dn_ask !== undefined) this.dnAsk = st.dn_ask;
+      if (st.btc_vol_30s !== undefined) this.btcVol30s = st.btc_vol_30s;
+      if (st.version) this.stratVersion = st.version;
 
-      // ── 持仓 ──
-      this.upPos = st.up_position && st.up_position.side ? st.up_position : null;
-      this.dnPos = st.dn_position && st.dn_position.side ? st.dn_position : null;
-      this.position = st.position && st.position.side ? st.position : null;
-      this.hasPosition = !!this.position || !!this.upPos || !!this.dnPos;
+      // ── 窗口 ──
+      if (st.elapsed_pct !== undefined) this.elapsedPct = st.elapsed_pct;
+      if (st.secs_left !== undefined) this.secsLeft = st.secs_left;
+      if (st.entry_zone) this.entryZone = st.entry_zone;
+      if (st.entry_start_pct !== undefined) this.entryStartPct = st.entry_start_pct;
+      if (st.entry_cutoff_pct !== undefined) this.entryCutoffPct = st.entry_cutoff_pct;
 
+      // ── 下注 ──
+      if (st.bets_this_window !== undefined) this.betsThisWindow = st.bets_this_window;
+      if (st.max_bets_per_window !== undefined) this.maxBetsPerWindow = st.max_bets_per_window;
+      if (st.cost_this_window !== undefined) this.costThisWindow = st.cost_this_window;
+      if (st.max_cost_per_window !== undefined) this.maxCostPerWindow = st.max_cost_per_window;
       if (st.cum_up_shares !== undefined) this.cumUpShares = st.cum_up_shares;
       if (st.cum_dn_shares !== undefined) this.cumDnShares = st.cum_dn_shares;
-      if (st.shares_gap !== undefined) this.sharesGap = st.shares_gap;
-      if (st.shares_gap_pct !== undefined) this.sharesGapPct = st.shares_gap_pct;
-      if (st.up_progress_pct !== undefined) this.upProgressPct = st.up_progress_pct;
-      if (st.dn_progress_pct !== undefined) this.dnProgressPct = st.dn_progress_pct;
-      if (st.entries_this_window !== undefined) this.entriesThisWindow = st.entries_this_window;
-      if (st.diverge_trades !== undefined) this.divergeTrades = st.diverge_trades;
-      if (st.revert_trades !== undefined) this.revertTrades = st.revert_trades;
 
-      this.tradeCount = st.trade_count || 0;
+      // ── 统计 ──
+      if (st.trade_count !== undefined) this.tradeCount = st.trade_count;
+      if (st.win_count !== undefined) this.winCount = st.win_count;
+      if (st.loss_count !== undefined) this.lossCount = st.loss_count;
+      if (st.cumulative_pnl !== undefined) this.cumulativePnl = st.cumulative_pnl;
+      if (st.win_rate !== undefined) this.winRate = st.win_rate;
 
       // ── 参数 ──
       if (st.params) {
-        this.paramEntries = Object.entries(st.params).filter(([k]) => typeof st.params[k] !== 'object');
-        if (st.params.open_threshold) this.openThreshold = st.params.open_threshold;
+        this.paramEntries = Object.entries(st.params).filter(([k, v]) => typeof v !== 'object');
       }
 
-      // ── 账户 & 绩效 ──
+      // ── 账户 ──
       if (st.account) {
         this.account = {
           balance: st.account.balance || 0,
@@ -572,31 +426,23 @@ function strategyPage() {
           daily_pnl: st.account.daily_pnl || 0,
         };
       }
-      this.winCount = st.win_count || 0;
-      this.lossCount = st.loss_count || 0;
-      this.cumulativePnl = st.cumulative_pnl || 0;
-      this.winRate = st.win_rate || 0;
 
-      // ── 历史成交: 分离 ENTRY / SETTLE ──
+      // ── 历史 ──
       if (st.trade_history) {
-        this.tradeHistory = st.trade_history;
         this.settlementHistory = st.trade_history.filter(t => t.action === 'SETTLE');
         this.entryHistory = st.trade_history.filter(t => t.action === 'ENTRY');
       }
 
-      // ── 更新图表 ──
-      this._pushPricePoint(st.binance_price || 0, st.rtds_price || 0, st.window_ptb || this.windowPtb);
-      this._pushDeviationPoint(st.deviation || 0);
+      // ── 图表 ──
+      this._pushPricePoint(st.rtds_price || 0, st.window_ptb || this.windowPtb);
     },
 
-    // ════════════ Chart.js BTC 行情图 (与 monitor_0x1d 一致) ════════════
+    // ════════════ Chart.js BTC 行情图 ════════════
 
     _initBtcChart() {
       const canvas = document.getElementById('chart-btc');
       if (!canvas) return;
 
-      // 关键: 把 Chart.js 实例存在 DOM 元素上, 不存在 Alpine data 中
-      // Alpine 3.x 的 Proxy 会破坏 Chart.js 内部操作
       canvas._chartInstance = new Chart(canvas.getContext('2d'), {
         type: 'line',
         data: {
@@ -605,19 +451,12 @@ function strategyPage() {
             label: 'Chainlink', data: [], borderColor: '#58a6ff', borderWidth: 1.5,
             pointRadius: 0, tension: 0.1, fill: false, order: 2
           }, {
-            label: 'Binance', data: [], borderColor: '#8b949e', borderWidth: 1,
-            pointRadius: 0, tension: 0.1, fill: false, order: 3
-          }, {
             label: 'PTB', data: [], borderColor: '#d29922', borderWidth: 1,
-            borderDash: [4,4], pointRadius: 0, fill: false, order: 4
+            borderDash: [4,4], pointRadius: 0, fill: false, order: 3
           }, {
-            label: 'UP入场', data: [], type: 'scatter',
-            backgroundColor: '#3fb950', borderColor: '#3fb950',
-            pointRadius: 5, pointStyle: 'triangle', showLine: false, order: 1
-          }, {
-            label: 'DN入场', data: [], type: 'scatter',
-            backgroundColor: '#f85149', borderColor: '#f85149',
-            pointRadius: 5, pointStyle: 'triangle', rotation: 180, showLine: false, order: 1
+            label: '入场', data: [], type: 'scatter',
+            backgroundColor: '#22c55e', borderColor: '#22c55e',
+            pointRadius: 6, pointStyle: 'crossRot', showLine: false, order: 1
           }]
         },
         options: {
@@ -626,200 +465,42 @@ function strategyPage() {
           scales: {
             x: { type: 'linear', display: false },
             y: {
-              ticks: { color: '#8b949e', font: { size: 10 }, callback: function(v) { return '$'+v.toLocaleString(); } },
+              ticks: { color: '#8b949e', font: { size: 10 }, callback: v => '$'+v.toLocaleString() },
               grid: { color: '#21262d' }
             }
           },
           plugins: {
             legend: { display: true, labels: { color: '#8b949e', boxWidth: 10, font: { size: 10 } } },
-            tooltip: {
-              callbacks: {
-                label: function(tip) {
-                  return tip.dataset.label + ': $' + (tip.parsed.y||0).toLocaleString();
-                }
-              }
-            }
+            tooltip: { callbacks: { label: tip => tip.dataset.label + ': $' + (tip.parsed.y||0).toLocaleString() } }
           }
         }
       });
     },
 
-    _pushPricePoint(bnPrice, rtdsPrice, ptb) {
-      if (bnPrice <= 0 && rtdsPrice <= 0) return;
+    _pushPricePoint(rtds, ptb) {
+      if (rtds <= 0) return;
       const idx = this._btcIdx++;
-
-      this.priceHistory.push({ idx, bn: bnPrice, rtds: rtdsPrice, ptb: ptb });
+      this.priceHistory.push({ idx, rtds, ptb });
       if (this.priceHistory.length > this._chartMaxPoints) {
         this.priceHistory = this.priceHistory.slice(-this._chartMaxPoints);
-        // 同步清理超出可见范围的入场标记
-        const minIdx = this.priceHistory[0].idx;
-        this.priceEntryMarkers = this.priceEntryMarkers.filter(e => e.idx >= minIdx);
       }
 
-      // 检查是否有新入场 → 收集 scatter 点
-      if (this.entryHistory.length > this.priceEntryMarkers.length) {
-        const newEntries = this.entryHistory.slice(this.priceEntryMarkers.length);
-        for (const e of newEntries) {
-          this.priceEntryMarkers.push({ ...e, idx });
-          this._addEntryMarker(new Date(), this.deviation, e.side);
-        }
-      }
-
-      // 更新 Chart.js (从 DOM 元素取实例, 绕过 Alpine Proxy)
       const chart = document.getElementById('chart-btc')?._chartInstance;
       if (!chart) return;
 
-      const rtdsData = this.priceHistory.filter(h => h.rtds > 0).map(h => ({x: h.idx, y: h.rtds}));
-      const bnData = this.priceHistory.filter(h => h.bn > 0).map(h => ({x: h.idx, y: h.bn}));
-      const ptbData = this.priceHistory.filter(h => h.ptb > 0).map(h => ({x: h.idx, y: h.ptb}));
+      chart.data.datasets[0].data = this.priceHistory.filter(h => h.rtds > 0).map(h => ({x: h.idx, y: h.rtds}));
+      chart.data.datasets[1].data = this.priceHistory.filter(h => h.ptb > 0).map(h => ({x: h.idx, y: h.ptb}));
 
-      const upEntries = this.priceEntryMarkers.filter(e => e.side === 'UP').map(e => {
-        const closest = this.priceHistory.reduce((best, h) => Math.abs(h.idx - e.idx) < Math.abs(best.idx - e.idx) ? h : best);
-        return {x: e.idx, y: closest.rtds || closest.bn};
-      });
-      const dnEntries = this.priceEntryMarkers.filter(e => e.side === 'DOWN' || e.side === 'DN').map(e => {
-        const closest = this.priceHistory.reduce((best, h) => Math.abs(h.idx - e.idx) < Math.abs(best.idx - e.idx) ? h : best);
-        return {x: e.idx, y: closest.rtds || closest.bn};
-      });
+      // 入场点标记 (简化: 映射到最近的 priceHistory idx)
+      if (this.entryHistory.length > 0) {
+        const entries = this.entryHistory.slice(-20).map(e => ({
+          x: this.priceHistory.length > 0 ? this.priceHistory[Math.min(this.priceHistory.length-1, Math.max(0, this.priceHistory.length - (this.entryHistory.length - this.entryHistory.indexOf(e))))].idx : 0,
+          y: e.btc || e.ptb || rtds
+        }));
+        chart.data.datasets[2].data = entries;
+      }
 
-      chart.data.datasets[0].data = rtdsData;
-      chart.data.datasets[1].data = bnData;
-      chart.data.datasets[2].data = ptbData;
-      chart.data.datasets[3].data = upEntries;
-      chart.data.datasets[4].data = dnEntries;
       chart.update('none');
-    },
-
-    // ════════════ ECharts Deviation 图表 ════════════
-
-    _initChart() {
-      const el = document.getElementById('deviation-chart');
-      if (!el) return;
-      this._chart = echarts.init(el, 'dark');
-      const option = {
-        backgroundColor: 'transparent',
-        grid: { left: 50, right: 20, top: 30, bottom: 30 },
-        tooltip: {
-          trigger: 'axis',
-          backgroundColor: '#1f2937',
-          borderColor: '#374151',
-          textStyle: { color: '#e5e7eb', fontSize: 11 },
-          formatter: (params) => {
-            let res = params[0].axisValueLabel + '<br/>';
-            for (const p of params) {
-              if (p.seriesName === 'Entry Points') continue;
-              res += `${p.marker} ${p.seriesName}: <b>${p.value[1] >= 0 ? '+' : ''}${p.value[1].toFixed(3)}</b><br/>`;
-            }
-            return res;
-          },
-        },
-        legend: {
-          data: ['Deviation', 'Open 阈值', 'Entry Points'],
-          textStyle: { color: '#9ca3af', fontSize: 10 },
-          top: 0,
-          right: 0,
-        },
-        xAxis: {
-          type: 'time',
-          axisLine: { lineStyle: { color: '#374151' } },
-          axisLabel: { color: '#9ca3af', fontSize: 10, formatter: '{HH}:{mm}:{ss}' },
-          splitLine: { show: false },
-        },
-        yAxis: {
-          type: 'value',
-          axisLine: { lineStyle: { color: '#374151' } },
-          axisLabel: { color: '#9ca3af', fontSize: 10, formatter: '{value}' },
-          splitLine: { lineStyle: { color: '#374151', type: 'dashed' } },
-        },
-        series: [
-          {
-            name: 'Deviation',
-            type: 'line',
-            smooth: true,
-            symbol: 'none',
-            lineStyle: { width: 2, color: '#6366f1' },
-            areaStyle: {
-              color: {
-                type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-                colorStops: [
-                  { offset: 0, color: 'rgba(99,102,241,0.3)' },
-                  { offset: 1, color: 'rgba(99,102,241,0)' }
-                ]
-              }
-            },
-            data: [],
-          },
-          {
-            name: 'Open 阈值',
-            type: 'line',
-            symbol: 'none',
-            lineStyle: { width: 1, color: '#eab308', type: 'dashed' },
-            data: [],
-            markLine: {
-              silent: true,
-              symbol: 'none',
-              lineStyle: { color: '#eab308', type: 'dashed', width: 1 },
-              label: { show: true, color: '#eab308', fontSize: 9, position: 'start' },
-              data: [
-                { yAxis: this.openThreshold, label: { formatter: '+Thr' } },
-                { yAxis: -this.openThreshold, label: { formatter: '-Thr' } },
-                { yAxis: 0, lineStyle: { color: '#4b5563' }, label: { show: false } },
-              ]
-            },
-          },
-          {
-            name: 'Entry Points',
-            type: 'scatter',
-            symbol: 'pin',
-            symbolSize: 16,
-            itemStyle: {
-              color: (p) => p.data[2] === 'UP' ? '#22c55e' : '#ef4444',
-            },
-            data: [],
-          },
-        ],
-      };
-      this._chart.setOption(option);
-      window.addEventListener('resize', () => this._chart && this._chart.resize());
-    },
-
-    _pushDeviationPoint(dev) {
-      const now = new Date();
-      this.deviationHistory.push([now, dev]);
-      if (this.deviationHistory.length > this._chartMaxPoints) {
-        this.deviationHistory = this.deviationHistory.slice(-this._chartMaxPoints);
-        // 同步清理超出可见范围的入场标记
-        const minTime = this.deviationHistory[0][0];
-        this.entryMarkers = this.entryMarkers.filter(e => e[0] >= minTime);
-      }
-      this._updateChart();
-    },
-
-    _addEntryMarker(time, dev, side) {
-      this.entryMarkers.push([time, dev, side]);
-      if (this.entryMarkers.length > 50) {
-        this.entryMarkers = this.entryMarkers.slice(-50);
-      }
-    },
-
-    _updateChart() {
-      if (!this._chart) return;
-      this._chart.setOption({
-        series: [
-          { name: 'Deviation', data: this.deviationHistory },
-          {
-            name: 'Open 阈值',
-            markLine: {
-              data: [
-                { yAxis: this.openThreshold, label: { formatter: '+Thr $' + this.openThreshold } },
-                { yAxis: -this.openThreshold, label: { formatter: '-Thr $' + this.openThreshold } },
-                { yAxis: 0, lineStyle: { color: '#4b5563' }, label: { show: false } },
-              ]
-            },
-          },
-          { name: 'Entry Points', data: this.entryMarkers },
-        ],
-      });
     },
   };
 }

@@ -27,6 +27,7 @@ BTC 5-min Tail Reversal Strategy v1.0
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from typing import Any
@@ -34,6 +35,7 @@ from typing import Any
 from loguru import logger
 
 from src.core.context import Context
+from src.core.event_bus import Event, EventType
 from src.strategy.base import Strategy
 from src.trading.executor import ExecutionStatus, OrderRequest, OrderResult, OrderType, Side
 
@@ -120,6 +122,10 @@ class TailReversalStrategy(Strategy):
         self._last_bet_time: float = 0.0
         self._bet_cooldown_s: float = 2.0
 
+        # ── Dashboard 交易历史 (供面板显示) ──
+        self._trade_history: list[dict] = []  # ENTRY / SETTLE 记录
+        self._max_trade_history: int = 200
+
     # ================================================================
     #  Strategy 接口
     # ================================================================
@@ -175,6 +181,9 @@ class TailReversalStrategy(Strategy):
 
         # ── 尾盘入场逻辑 ──
         await self._tail_entry(context)
+
+        # ── 推送状态到 Dashboard ──
+        self._push_state(context)
 
     def on_stop(self, context: Context) -> None:
         self._log_deviation_summary()
@@ -360,6 +369,26 @@ class TailReversalStrategy(Strategy):
             ctx.account.balance -= actual_cost
             ctx.account.available -= actual_cost
 
+            # ── 记录到 Dashboard 交易历史 ──
+            import datetime as _dt
+            self._trade_history.append({
+                "action": "ENTRY",
+                "time": _dt.datetime.fromtimestamp(now).strftime("%H:%M:%S"),
+                "side": cheap_side,
+                "price": round(cheap_ask, 4),
+                "shares": round(filled_shares, 1),
+                "cost": round(actual_cost, 2),
+                "odds": round(odds, 1),
+                "deviation": round(deviation, 2),
+                "btc": round(btc, 2),
+                "ptb": round(ptb, 2),
+                "balance_after": round(ctx.account.balance, 2),
+                "elapsed_pct": round(elapsed_pct * 100, 1),
+                "secs_left": round(secs_left, 0),
+            })
+            if len(self._trade_history) > self._max_trade_history:
+                self._trade_history = self._trade_history[-self._max_trade_history:]
+
             logger.info(
                 f"[{self.name()}] ✓ 成交 {cheap_side} | "
                 f"{filled_shares:.1f}sh@{cheap_ask:.4f}=${actual_cost:.2f} | "
@@ -441,12 +470,127 @@ class TailReversalStrategy(Strategy):
             f"余额=${ctx.account.balance:.2f}"
         )
 
+        # ── 记录到 Dashboard 交易历史 ──
+        import datetime as _dt
+        self._trade_history.append({
+            "action": "SETTLE",
+            "time": _dt.datetime.now().strftime("%H:%M:%S"),
+            "winner": winner_side,
+            "result": "WIN" if won else "LOSE",
+            "up_shares": round(up_shares, 1),
+            "dn_shares": round(dn_shares, 1),
+            "size": round(total_cost, 2),
+            "payout": round(payout, 2),
+            "pnl": round(net_pnl, 4),
+            "btc": round(btc, 2),
+            "ptb": round(ptb, 2),
+            "deviation_avg": round(sum(d["abs_deviation"] for d in self._window_deviations) / len(self._window_deviations), 2) if self._window_deviations else 0,
+        })
+        if len(self._trade_history) > self._max_trade_history:
+            self._trade_history = self._trade_history[-self._max_trade_history:]
+
         # ── 全局偏离统计摘要 (每10次结算打一次) ──
         total_settles = self._win_count + self._loss_count
         if total_settles > 0 and total_settles % 10 == 0:
             self._log_deviation_summary()
 
         self._positions.clear()
+
+    # ================================================================
+    #  Dashboard 状态推送
+    # ================================================================
+
+    def _push_state(self, ctx: Context) -> None:
+        """将策略状态推送到 Dashboard via context + EventBus."""
+        secs_left = ctx.market.pm_window_seconds_left
+        elapsed_pct = (300 - secs_left) / 300.0 if secs_left > 0 else 0
+        btc = ctx.market.btc_price
+        ptb = self._window_ptb if self._window_ptb > 0 else ctx.market.pm_window_start_price
+        deviation = btc - ptb if ptb > 0 else 0
+        abs_dev = abs(deviation)
+
+        up_ask = ctx.market.pm_yes_ask or ctx.market.pm_yes_price
+        dn_ask = ctx.market.pm_no_ask or ctx.market.pm_no_price
+
+        # 判断哪侧便宜
+        btc_up = btc > ptb if ptb > 0 else False
+        cheap_side = "DOWN" if btc_up else "UP"
+        cheap_ask = dn_ask if btc_up else up_ask
+
+        # 入场区间判断
+        in_entry_zone = self._entry_start_pct <= elapsed_pct <= self._entry_cutoff_pct
+        zone = "WAIT"
+        if elapsed_pct >= self._entry_cutoff_pct:
+            zone = "CUTOFF"
+        elif in_entry_zone:
+            zone = "ACTIVE"
+
+        total_games = self._win_count + self._loss_count
+
+        state = {
+            "name": self.name(),
+            "version": self.version(),
+            "strategy_type": "tail_reversal",
+            # ── 市场数据 ──
+            "rtds_price": round(btc, 2),
+            "window_ptb": round(ptb, 2),
+            "deviation": round(deviation, 2),
+            "abs_deviation": round(abs_dev, 2),
+            "up_ask": round(up_ask, 4) if up_ask else 0,
+            "dn_ask": round(dn_ask, 4) if dn_ask else 0,
+            "cheap_side": cheap_side,
+            "cheap_ask": round(cheap_ask, 4) if cheap_ask else 0,
+            # ── 窗口进度 ──
+            "elapsed_pct": round(elapsed_pct * 100, 1),
+            "secs_left": round(secs_left, 0),
+            "entry_zone": zone,
+            "entry_start_pct": round(self._entry_start_pct * 100),
+            "entry_cutoff_pct": round(self._entry_cutoff_pct * 100),
+            # ── 当前窗口下注 ──
+            "bets_this_window": self._bets_this_window,
+            "max_bets_per_window": self._max_bets_per_window,
+            "cost_this_window": round(self._cost_this_window, 2),
+            "max_cost_per_window": self._max_cost_per_window,
+            # ── 持仓 ──
+            "cum_up_shares": round(self._cum_up_shares, 1),
+            "cum_dn_shares": round(self._cum_dn_shares, 1),
+            "cum_up_cost": round(self._cum_up_cost, 2),
+            "cum_dn_cost": round(self._cum_dn_cost, 2),
+            "positions": self._positions[-10:],  # 最近10笔
+            "has_position": len(self._positions) > 0,
+            # ── 统计 ──
+            "trade_count": self._trade_count,
+            "win_count": self._win_count,
+            "loss_count": self._loss_count,
+            "cumulative_pnl": round(self._cumulative_pnl, 4),
+            "win_rate": round(
+                self._win_count / max(total_games, 1) * 100, 1
+            ),
+            # ── 波动率 ──
+            "btc_vol_30s": round(self._calc_btc_vol(ctx.now(), 30.0), 2),
+            # ── 账户 ──
+            "account": {
+                "balance": round(ctx.account.balance, 2),
+                "available": round(ctx.account.available, 2),
+                "total_equity": round(ctx.account.total_equity, 2),
+                "daily_pnl": round(ctx.account.daily_pnl, 4),
+            },
+            # ── 历史 ──
+            "trade_history": self._trade_history,
+            # ── 参数 ──
+            "params": self.get_params(),
+        }
+
+        ctx.set("strategy_state", state)
+
+        try:
+            asyncio.ensure_future(ctx.event_bus.publish(Event(
+                type=EventType.SIGNAL_GENERATED,
+                data=state,
+                source=self.name(),
+            )))
+        except RuntimeError:
+            pass
 
     # ================================================================
     #  辅助函数
