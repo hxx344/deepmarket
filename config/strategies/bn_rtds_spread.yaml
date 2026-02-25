@@ -7,7 +7,7 @@ strategy:
   name: "bn_rtds_spread"
   module: src.strategy.templates.bn_rtds_spread
   class: BnRtdsSpreadStrategy
-  enabled: true
+  enabled: false
 
   params:
     # ── 核心仓位 ──
