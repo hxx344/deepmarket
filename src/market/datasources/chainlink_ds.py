@@ -5,10 +5,12 @@ Polymarket BTC 5-min 市场结算使用 Chainlink Data Streams BTC/USD。
 本模块提供与 PM 结算一致的 BTC/USD 价格流。
 
 数据源优先级 (auto 模式):
-  1. PM RTDS WebSocket          — 免费! PM 自己转发的 Chainlink 价格, 无需任何 key
+  1. PM RTDS WebSocket          — 免费! PM 自己转发的 Chainlink 价格, 连接失败时指数退避重连
   2. Chainlink Data Streams API — 精确匹配 PM 结算, 需要 API key
-  3. Binance BTC/USDT           — Data Streams 底层聚合源, 差异极小
-  4. Chainlink 链上 Price Feed  — 最后兜底, 延迟 ~30s
+  3. Chainlink 链上 Price Feed  — 最后兜底, 延迟 ~30s
+
+  ⚠️ Binance BTC/USDT 不再作为 auto 模式的降级目标 (价差风险),
+     仅在 mode="binance" 显式指定时使用。
 
 参考:
   https://data.chain.link/streams/btc-usd
@@ -87,10 +89,10 @@ class ChainlinkConfig:
     kline_interval: str = "5m"   # 聚合 K 线周期
 
     # ── 连接模式 ──
-    # "auto"     = RTDS → Data Streams → Binance → 链上 (推荐)
+    # "auto"     = RTDS (退避重连) → Data Streams → 链上 (不降级到 Binance)
     # "rtds"     = 仅 PM RTDS WebSocket
     # "streams"  = 仅 Chainlink Data Streams API
-    # "binance"  = 仅 Binance
+    # "binance"  = 仅 Binance (显式指定时可用)
     # "onchain"  = 仅链上 Price Feed
     mode: str = "auto"
 
@@ -167,30 +169,43 @@ class ChainlinkDataSource(DataSourceBase):
         """
         按优先级尝试连接价格源。
 
-        auto 模式依次尝试: PM RTDS → Data Streams → Binance → 链上
+        auto 模式: PM RTDS (退避重试) → Data Streams → 链上
+        Binance 仅在显式 mode="binance" 时使用, 不作为自动降级目标。
         """
         self.status = DataSourceStatus.CONNECTING
         self._session = aiohttp.ClientSession()
         mode = self.config.mode
 
         # 1. 尝试 PM RTDS WebSocket (免费 Chainlink 价格)
+        #    RTDS 是 PM 结算的权威数据源, auto 模式下会重试而非降级到 Binance
         if mode in ("rtds", "auto"):
-            try:
-                price = await self._test_rtds_connection()
-                self._active_source = "rtds"
-                self._last_price = price
-                self._last_price_ts = time.time()
-                self.status = DataSourceStatus.CONNECTED
-                logger.info(
-                    f"[PM RTDS] 连接成功, Chainlink BTC/USD: ${price:,.2f} "
-                    f"(免费, 与 PM 结算一致)"
-                )
-                return
-            except Exception as e:
-                logger.warning(f"PM RTDS 不可用: {e}")
-                if mode == "rtds":
-                    self.status = DataSourceStatus.ERROR
-                    raise
+            max_retries = 5 if mode == "auto" else 1
+            retry_delay = 2.0
+            for attempt in range(1, max_retries + 1):
+                try:
+                    price = await self._test_rtds_connection()
+                    self._active_source = "rtds"
+                    self._last_price = price
+                    self._last_price_ts = time.time()
+                    self.status = DataSourceStatus.CONNECTED
+                    logger.info(
+                        f"[PM RTDS] 连接成功, Chainlink BTC/USD: ${price:,.2f} "
+                        f"(免费, 与 PM 结算一致)"
+                    )
+                    return
+                except Exception as e:
+                    logger.warning(
+                        f"PM RTDS 不可用 (尝试 {attempt}/{max_retries}): {e}"
+                    )
+                    if attempt < max_retries:
+                        logger.info(
+                            f"{retry_delay:.0f}s 后重试 RTDS (退避策略)..."
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, 30.0)
+                    elif mode == "rtds":
+                        self.status = DataSourceStatus.ERROR
+                        raise
 
         # 2. 尝试 Chainlink Data Streams API
         if mode in ("streams", "auto") and self.config.client_id:
@@ -211,8 +226,8 @@ class ChainlinkDataSource(DataSourceBase):
                     self.status = DataSourceStatus.ERROR
                     raise
 
-        # 3. 尝试 Binance
-        if mode in ("binance", "auto"):
+        # 3. 尝试 Binance (仅 binance 显式模式, auto 不降级到 Binance)
+        if mode == "binance":
             try:
                 price = await self._fetch_binance_rest()
                 self._active_source = "binance"
@@ -220,15 +235,14 @@ class ChainlinkDataSource(DataSourceBase):
                 self._last_price_ts = time.time()
                 self.status = DataSourceStatus.CONNECTED
                 logger.info(
-                    f"[Binance 兜底] 连接成功, BTC/USDT: ${price:,.2f} "
-                    f"(Data Streams 聚合源, 差异极小)"
+                    f"[Binance] 连接成功, BTC/USDT: ${price:,.2f} "
+                    f"(显式 Binance 模式)"
                 )
                 return
             except Exception as e:
                 logger.warning(f"Binance 不可用: {e}")
-                if mode == "binance":
-                    self.status = DataSourceStatus.ERROR
-                    raise
+                self.status = DataSourceStatus.ERROR
+                raise
 
         # 4. 尝试链上 Price Feed
         if mode in ("onchain", "auto"):
@@ -286,27 +300,27 @@ class ChainlinkDataSource(DataSourceBase):
     async def _poll_price_loop(self) -> None:
         """轮询方式获取价格 (Data Streams / 链上)"""
         consecutive_errors = 0
+        poll_backoff = self.config.poll_interval
         while self._running:
             try:
                 price, timestamp = await self._fetch_price_by_source()
                 if price > 0:
                     await self._on_price_update(price, timestamp)
                     consecutive_errors = 0
+                    poll_backoff = self.config.poll_interval  # 成功时重置
             except Exception as e:
                 consecutive_errors += 1
                 logger.error(
                     f"价格获取失败 ({self._active_source}): {e} "
                     f"(连续 {consecutive_errors} 次)"
                 )
-                # 连续 3 次失败, 尝试自动降级
-                if consecutive_errors >= 3 and self.config.mode == "auto":
-                    logger.warning(
-                        f"{self._active_source} 连续失败, 尝试降级..."
-                    )
-                    if await self._try_fallback():
-                        return
+                # 退避策略: 连续失败时增大轮询间隔, 最大 60s
+                poll_backoff = min(poll_backoff * 2, 60.0)
+                logger.info(
+                    f"轮询间隔退避至 {poll_backoff:.0f}s"
+                )
 
-            await asyncio.sleep(self.config.poll_interval)
+            await asyncio.sleep(poll_backoff)
 
     async def _stream_binance_ws(self) -> None:
         """通过 Binance WebSocket 接收 BTC/USDT 实时成交价"""
@@ -338,27 +352,16 @@ class ChainlinkDataSource(DataSourceBase):
                 await asyncio.sleep(5)
 
     async def _try_fallback(self) -> bool:
-        """尝试降级到下一个可用数据源, 成功返回 True"""
-        fallback_order = ["binance", "onchain"]
-        for source in fallback_order:
-            if source == self._active_source:
-                continue
+        """尝试降级到链上数据源 (不降级到 Binance, 避免价差风险)"""
+        if self._active_source != "onchain":
             try:
-                if source == "binance":
-                    price = await self._fetch_binance_rest()
-                    self._active_source = "binance"
-                    logger.info(f"已降级到 Binance, BTC/USDT: ${price:,.2f}")
-                    await self._on_price_update(price, time.time())
-                    await self._stream_binance_ws()
-                    return True
-                elif source == "onchain":
-                    price = await self._read_onchain_price()
-                    self._active_source = "onchain"
-                    logger.info(f"已降级到链上, BTC/USD: ${price:,.2f}")
-                    await self._on_price_update(price, time.time())
-                    return False  # 继续 poll loop
+                price = await self._read_onchain_price()
+                self._active_source = "onchain"
+                logger.info(f"已降级到链上, BTC/USD: ${price:,.2f}")
+                await self._on_price_update(price, time.time())
+                return False  # 继续 poll loop
             except Exception as e:
-                logger.warning(f"{source} 降级失败: {e}")
+                logger.warning(f"链上降级失败: {e}")
         return False
 
     async def _fetch_price_by_source(self) -> tuple[float, float]:
@@ -501,9 +504,12 @@ class ChainlinkDataSource(DataSourceBase):
 
         客户端通过 _parse_rtds_price(symbol_filter="btc/usd") 过滤非 BTC 消息。
         看门狗: 30s 无 BTC 价格数据则断开重连 (正常情况每秒有 ~1 条 BTC 推送)。
+
+        重连策略: 指数退避 (2s → 4s → 8s → ... → 60s), 不降级到 Binance。
+        RTDS 是 PM 结算的权威数据源, 切换到 Binance 会引入价差风险。
         """
-        rtds_fail_count = 0
-        max_rtds_fails = 3  # 连续失败 N 次后降级
+        reconnect_delay = 2.0
+        max_reconnect_delay = 60.0
         silence_timeout = 30.0  # 现在有每秒推送, 30s 无数据就是真的断了
 
         while self._running:
@@ -524,7 +530,7 @@ class ChainlinkDataSource(DataSourceBase):
                         ],
                     })
                     logger.debug("PM RTDS WebSocket 已连接, 订阅 crypto_prices_chainlink (无filter, 客户端过滤btc/usd)")
-                    rtds_fail_count = 0  # 连接成功, 重置计数
+                    reconnect_delay = 2.0  # 连接成功, 重置退避
 
                     # 数据静默看门狗: 跟踪最后一次收到 BTC 价格的时间
                     last_data_time = time.time()
@@ -572,24 +578,26 @@ class ChainlinkDataSource(DataSourceBase):
 
                     # 正常退出循环 = WS 被关闭, 需要重连
                     if self._running:
-                        logger.info("RTDS WS 连接已断开, 2s 后重连...")
-                        await asyncio.sleep(2)
+                        logger.info(
+                            f"RTDS WS 连接已断开, "
+                            f"{reconnect_delay:.0f}s 后重连 (退避策略)..."
+                        )
+                        await asyncio.sleep(reconnect_delay)
+                        reconnect_delay = min(
+                            reconnect_delay * 2, max_reconnect_delay
+                        )
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                rtds_fail_count += 1
                 logger.warning(
                     f"PM RTDS 断开: {e}, "
-                    f"连续失败 {rtds_fail_count}/{max_rtds_fails}, "
-                    f"5s 后重连..."
+                    f"{reconnect_delay:.0f}s 后重连 (退避策略)..."
                 )
-                # auto 模式下如果 RTDS 持续失败, 降级到 Binance
-                if self.config.mode == "auto" and rtds_fail_count >= max_rtds_fails:
-                    logger.warning("RTDS 连续失败, 尝试降级...")
-                    if await self._try_fallback():
-                        return
-                await asyncio.sleep(5)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(
+                    reconnect_delay * 2, max_reconnect_delay
+                )
 
     # ================================================================
     #  Chainlink Data Streams API (与 PM 结算一致)
@@ -670,7 +678,7 @@ class ChainlinkDataSource(DataSourceBase):
         }
 
     # ================================================================
-    #  Binance 兜底
+    #  Binance (仅 mode="binance" 显式模式)
     # ================================================================
 
     async def _fetch_binance_rest(self) -> float:
