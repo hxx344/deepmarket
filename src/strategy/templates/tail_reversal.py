@@ -261,27 +261,22 @@ class TailReversalStrategy(Strategy):
         if up_ask <= 0 or dn_ask <= 0:
             return
 
-        # 判断哪一侧更便宜
-        # BTC > PTB → 当前偏 UP → DOWN 更便宜 → 买 DOWN 赌翻转
-        # BTC < PTB → 当前偏 DOWN → UP 更便宜 → 买 UP 赌翻转
+        # 判断哪一侧更便宜 (直接比较 ask 价格)
         btc = ctx.market.btc_price
         ptb = self._window_ptb if self._window_ptb > 0 else ctx.market.pm_window_start_price
         if ptb <= 0 or btc <= 0:
             return
 
-        btc_up = btc > ptb
-        if btc_up:
-            # 当前 UP 领先, DOWN 便宜 → 买 DOWN 赌翻转
-            cheap_side = "DOWN"
-            cheap_ask = dn_ask
-            expensive_ask = up_ask
-            order_side = Side.NO
-        else:
-            # 当前 DOWN 领先, UP 便宜 → 买 UP 赌翻转
+        if up_ask <= dn_ask:
             cheap_side = "UP"
             cheap_ask = up_ask
             expensive_ask = dn_ask
             order_side = Side.YES
+        else:
+            cheap_side = "DOWN"
+            cheap_ask = dn_ask
+            expensive_ask = up_ask
+            order_side = Side.NO
 
         # ── 3. 价格筛选 ──
         if cheap_ask > self._cheap_side_max:
@@ -512,10 +507,19 @@ class TailReversalStrategy(Strategy):
         up_ask = ctx.market.pm_yes_ask or ctx.market.pm_yes_price
         dn_ask = ctx.market.pm_no_ask or ctx.market.pm_no_price
 
-        # 判断哪侧便宜
-        btc_up = btc > ptb if ptb > 0 else False
-        cheap_side = "DOWN" if btc_up else "UP"
-        cheap_ask = dn_ask if btc_up else up_ask
+        # 判断哪侧便宜 (直接比较 ask 价格, 选更低的)
+        if up_ask and dn_ask and up_ask > 0 and dn_ask > 0:
+            if up_ask <= dn_ask:
+                cheap_side = "UP"
+                cheap_ask = up_ask
+            else:
+                cheap_side = "DOWN"
+                cheap_ask = dn_ask
+        else:
+            # fallback: 根据 BTC 方向推断
+            btc_up = btc > ptb if ptb > 0 else False
+            cheap_side = "DOWN" if btc_up else "UP"
+            cheap_ask = dn_ask if btc_up else up_ask
 
         # 入场区间判断
         in_entry_zone = self._entry_start_pct <= elapsed_pct <= self._entry_cutoff_pct
