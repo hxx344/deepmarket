@@ -216,6 +216,11 @@ class TailReversalStrategy(Strategy):
         if secs_left <= 0:
             return
 
+        # ── 窗口开始 5s 内不交易 (等价格稳定) ──
+        elapsed = 300 - secs_left
+        if elapsed < 5:
+            return
+
         # ── 下注上限 ──
         if self._bets_this_window >= self._max_bets_per_window:
             return
