@@ -540,8 +540,8 @@ async def run_live(cfg: dict, ctx: Context):
         bus.subscribe(EventType.ORDERBOOK_UPDATE, _make_book_cb())
         bus.subscribe(EventType.ORDER_FILLED, _make_order_cb())
 
-        # btc5min_taker / bn_rtds_spread 策略额外订阅: 实时 BTC 价格 tick + PM 价格驱动
-        if strat.name() in ("btc5min_taker", "bn_rtds_spread"):
+        # 实时 BTC 价格 tick + PM 价格驱动 (需要逐 tick 驱动的策略)
+        if strat.name() in ("btc5min_taker", "bn_rtds_spread", "tail_reversal"):
             def _make_tick_cb(s=strat):
                 async def _h(e):
                     r = s.on_market_data(ctx, e.data)
