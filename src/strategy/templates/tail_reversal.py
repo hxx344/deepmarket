@@ -50,35 +50,21 @@ class TailReversalStrategy(Strategy):
 
     def __init__(
         self,
-        # ── 入场时机 ──
-        entry_start_pct: float = 0.80,         # 窗口进度 ≥80% 开始观察 (≈60s left)
-        entry_cutoff_pct: float = 0.95,        # 窗口进度 ≥95% 停止入场 (≈15s left)
         # ── 价格条件 (核心) ──
-        cheap_side_max_price: float = 0.01,    # 便宜侧 ask = 0.01 才入场 (100x 赔率)
-        cheap_side_min_price: float = 0.01,    # 地板价
-        # ── 波动率过滤 ──
-        min_btc_vol_30s: float = 5.0,          # 30s BTC 波动 ≥ $5 (有翻转可能)
+        target_ask_price: float = 0.01,        # ask = 0.01 时买入 (99x 赔率)
         # ── 下注大小 ──
         bet_size_usdc: float = 5.0,            # 每次下注金额 (USDC), 小注高赔率
-        max_bets_per_window: int = 3,          # 单窗口最多下注次数
+        max_bets_per_window: int = 2,          # 单窗口最多下注次数 (UP+DOWN 各1次)
         max_cost_per_window: float = 20.0,     # 单窗口最大总投入
-        # ── 方向确认 ──
-        require_btc_counter_move: bool = False, # 不要求 BTC 短期有反向迹象
-        counter_move_lookback_s: float = 5.0,  # 反向判断回看窗口
-        counter_move_threshold: float = 1.0,   # BTC 反向 ≥ $1 才确认
+        # ── 方向确认 (已禁用, 保留接口兼容) ──
+        require_btc_counter_move: bool = False,
+        counter_move_lookback_s: float = 5.0,
+        counter_move_threshold: float = 1.0,
         # ── 手续费 ──
         fee_rate: float = 0.002,
     ) -> None:
-        # 入场时机
-        self._entry_start_pct = entry_start_pct
-        self._entry_cutoff_pct = entry_cutoff_pct
-
         # 价格条件
-        self._cheap_side_max = cheap_side_max_price
-        self._cheap_side_min = cheap_side_min_price
-
-        # 波动率
-        self._min_btc_vol_30s = min_btc_vol_30s
+        self._target_ask = target_ask_price
 
         # 下注
         self._bet_size = bet_size_usdc
@@ -99,6 +85,7 @@ class TailReversalStrategy(Strategy):
         self._bets_this_window: int = 0
         self._cost_this_window: float = 0.0
         self._window_ptb: float = 0.0
+        self._bought_sides: set[str] = set()  # 本窗口已买入的方向 {"UP", "DOWN"}
 
         # ── 持仓 ──
         self._positions: list[dict] = []
@@ -139,24 +126,16 @@ class TailReversalStrategy(Strategy):
     def description(self) -> str:
         return (
             f"BTC 5-min Tail Reversal v1.0 ("
-            f"entry={self._entry_start_pct:.0%}-{self._entry_cutoff_pct:.0%}, "
-            f"cheap≤{self._cheap_side_max:.2f}, "
+            f"ask={self._target_ask:.2f}, "
             f"bet=${self._bet_size:.0f}x{self._max_bets_per_window})"
         )
 
     def get_params(self) -> dict[str, Any]:
         return {
-            "entry_start_pct": self._entry_start_pct,
-            "entry_cutoff_pct": self._entry_cutoff_pct,
-            "cheap_side_max_price": self._cheap_side_max,
-            "cheap_side_min_price": self._cheap_side_min,
-            "min_btc_vol_30s": self._min_btc_vol_30s,
+            "target_ask_price": self._target_ask,
             "bet_size_usdc": self._bet_size,
             "max_bets_per_window": self._max_bets_per_window,
             "max_cost_per_window": self._max_cost_per_window,
-            "require_btc_counter_move": self._require_counter_move,
-            "counter_move_lookback_s": self._counter_lookback_s,
-            "counter_move_threshold": self._counter_threshold,
             "fee_rate": self._fee_rate,
         }
 
@@ -206,6 +185,7 @@ class TailReversalStrategy(Strategy):
             self._last_window_ts = wst
             self._bets_this_window = 0
             self._cost_this_window = 0.0
+            self._bought_sides.clear()
             self._cum_up_shares = 0.0
             self._cum_dn_shares = 0.0
             self._cum_up_cost = 0.0
@@ -215,7 +195,7 @@ class TailReversalStrategy(Strategy):
             self._window_ptb = context.market.btc_price
             logger.info(
                 f"[{self.name()}] 新窗口 PTB=${self._window_ptb:,.2f} | "
-                f"等待尾盘机会 ({self._entry_start_pct:.0%}+)"
+                f"等待 ask=0.01 买入机会"
             )
 
     # ================================================================
@@ -224,24 +204,16 @@ class TailReversalStrategy(Strategy):
 
     async def _tail_entry(self, ctx: Context) -> None:
         """
-        在窗口末段, 当一侧被推到极端后买入便宜的另一侧.
+        窗口内任意时刻, 只要任一方向 ask = target_ask (0.01) 就买入.
 
-        入场条件:
-            1. 窗口进度在 [entry_start_pct, entry_cutoff_pct] 之间
-            2. 便宜侧 ask 在 [min_price, max_price] 范围内
-            3. BTC 30s 波动率 ≥ 阈值 (有翻转动能)
-            4. (可选) BTC 短期出现反向迹象
-            5. 未超过窗口下注上限
+        规则:
+            1. 每个方向每窗口只买一次 (UP 一次 + DOWN 一次 = 最多 2 笔)
+            2. 不限制入场时间窗口
+            3. 不要求波动率条件
+            4. ask 必须精确等于 target_ask (0.01)
         """
         secs_left = ctx.market.pm_window_seconds_left
         if secs_left <= 0:
-            return
-
-        # ── 1. 时间窗口 ──
-        elapsed_pct = (300 - secs_left) / 300.0
-        if elapsed_pct < self._entry_start_pct:
-            return
-        if elapsed_pct > self._entry_cutoff_pct:
             return
 
         # ── 下注上限 ──
@@ -255,141 +227,130 @@ class TailReversalStrategy(Strategy):
         if now - self._last_bet_time < self._bet_cooldown_s:
             return
 
-        # ── 2. 找出便宜侧 ──
+        # ── 读取两侧 ask ──
         up_ask = ctx.market.pm_yes_ask or ctx.market.pm_yes_price
         dn_ask = ctx.market.pm_no_ask or ctx.market.pm_no_price
         if up_ask <= 0 or dn_ask <= 0:
             return
 
-        # 判断哪一侧更便宜 (直接比较 ask 价格)
         btc = ctx.market.btc_price
         ptb = self._window_ptb if self._window_ptb > 0 else ctx.market.pm_window_start_price
         if ptb <= 0 or btc <= 0:
             return
 
-        if up_ask <= dn_ask:
-            cheap_side = "UP"
-            cheap_ask = up_ask
-            expensive_ask = dn_ask
-            order_side = Side.YES
-        else:
-            cheap_side = "DOWN"
-            cheap_ask = dn_ask
-            expensive_ask = up_ask
-            order_side = Side.NO
+        elapsed_pct = (300 - secs_left) / 300.0
 
-        # ── 3. 价格筛选 ──
-        if cheap_ask > self._cheap_side_max:
-            return  # 不够便宜, 赔率不够高
-        if cheap_ask < self._cheap_side_min:
-            return  # 太便宜, 可能无流动性
+        # ── 检查每个方向是否有 ask = target_ask 且未买过 ──
+        candidates: list[tuple[str, float, Side]] = []
+        if abs(up_ask - self._target_ask) < 0.001 and "UP" not in self._bought_sides:
+            candidates.append(("UP", up_ask, Side.YES))
+        if abs(dn_ask - self._target_ask) < 0.001 and "DOWN" not in self._bought_sides:
+            candidates.append(("DOWN", dn_ask, Side.NO))
 
-        odds = (1.0 - cheap_ask) / cheap_ask if cheap_ask > 0 else 0
-        # odds = 净赔率 (买$0.10翻转赢$0.90 → odds=9.0)
-
-        # ── 4. 波动率检查 ──
-        btc_vol = self._calc_btc_vol(now, lookback_s=30.0)
-        if btc_vol < self._min_btc_vol_30s:
-            return  # 波动太小, 翻转概率极低
-
-        # ── 5. (可选) 反向迹象 ──
-        if self._require_counter_move:
-            has_counter = self._check_counter_move(now, btc_up)
-            if not has_counter:
-                return
-
-        # ── 6. 计算下注金额 ──
-        remaining_budget = self._max_cost_per_window - self._cost_this_window
-        bet = min(self._bet_size, remaining_budget, ctx.account.available * 0.05)
-        if bet < 1.0:
+        if not candidates:
             return
 
-        potential_payout = bet / cheap_ask  # shares = bet / price, 赢时每 share = $1
-        potential_profit = potential_payout - bet
+        # ── 逐个买入 ──
+        for cheap_side, cheap_ask, order_side in candidates:
+            if self._bets_this_window >= self._max_bets_per_window:
+                break
+            if self._cost_this_window >= self._max_cost_per_window:
+                break
 
-        btc_diff = abs(btc - ptb)
-        logger.info(
-            f"[{self.name()}] 🎯 尾盘反转信号! | "
-            f"买{cheap_side}@{cheap_ask:.4f} ${bet:.2f} | "
-            f"赔率={odds:.1f}x 潜在利润=${potential_profit:.2f} | "
-            f"BTC={btc:,.2f} vs PTB={ptb:,.2f} diff=${btc_diff:.2f} | "
-            f"vol_30s=${btc_vol:.2f} elapsed={elapsed_pct:.1%} secs_left={secs_left:.0f}"
-        )
+            odds = (1.0 - cheap_ask) / cheap_ask if cheap_ask > 0 else 0
 
-        # ── 7. 下单 ──
-        result = await self._submit_order(ctx, order_side, cheap_ask, bet)
+            remaining_budget = self._max_cost_per_window - self._cost_this_window
+            bet = min(self._bet_size, remaining_budget, ctx.account.available * 0.05)
+            if bet < 1.0:
+                break
 
-        if result and result.status == ExecutionStatus.FILLED:
-            filled_shares = result.filled_size
-            actual_cost = filled_shares * cheap_ask
+            potential_payout = bet / cheap_ask
+            potential_profit = potential_payout - bet
 
-            if cheap_side == "UP":
-                self._cum_up_shares += filled_shares
-                self._cum_up_cost += actual_cost
-            else:
-                self._cum_dn_shares += filled_shares
-                self._cum_dn_cost += actual_cost
-
-            self._bets_this_window += 1
-            self._cost_this_window += actual_cost
-            self._last_bet_time = now
-            self._trade_count += 1
-
-            # ── 记录RTDS偏离度 ──
-            deviation = btc - ptb  # 正=BTC>PTB(偏UP), 负=BTC<PTB(偏DN)
-            abs_dev = abs(deviation)
-            dev_record = {
-                "side": cheap_side,
-                "deviation": deviation,
-                "abs_deviation": abs_dev,
-                "btc": btc,
-                "ptb": ptb,
-                "entry_time": now,
-            }
-            self._window_deviations.append(dev_record)
-            self._deviation_stats.append(dev_record)
-
-            self._positions.append({
-                "side": cheap_side,
-                "entry_price": cheap_ask,
-                "shares": filled_shares,
-                "cost": actual_cost,
-                "entry_time": now,
-                "odds": odds,
-                "btc_at_entry": btc,
-                "ptb": ptb,
-                "deviation": deviation,
-            })
-
-            ctx.account.balance -= actual_cost
-            ctx.account.available -= actual_cost
-
-            # ── 记录到 Dashboard 交易历史 ──
-            import datetime as _dt
-            self._trade_history.append({
-                "action": "ENTRY",
-                "time": _dt.datetime.fromtimestamp(now).strftime("%H:%M:%S"),
-                "side": cheap_side,
-                "price": round(cheap_ask, 4),
-                "shares": round(filled_shares, 1),
-                "cost": round(actual_cost, 2),
-                "odds": round(odds, 1),
-                "deviation": round(deviation, 2),
-                "btc": round(btc, 2),
-                "ptb": round(ptb, 2),
-                "balance_after": round(ctx.account.balance, 2),
-                "elapsed_pct": round(elapsed_pct * 100, 1),
-                "secs_left": round(secs_left, 0),
-            })
-            if len(self._trade_history) > self._max_trade_history:
-                self._trade_history = self._trade_history[-self._max_trade_history:]
-
+            btc_diff = abs(btc - ptb)
             logger.info(
-                f"[{self.name()}] ✓ 成交 {cheap_side} | "
-                f"{filled_shares:.1f}sh@{cheap_ask:.4f}=${actual_cost:.2f} | "
-                f"RTDS偏离PTB=${deviation:+.2f} (|{abs_dev:.2f}|) | "
-                f"累计投入: ${self._cost_this_window:.2f}/{self._max_cost_per_window:.0f}"
+                f"[{self.name()}] 🎯 ask=0.01 触发! | "
+                f"买{cheap_side}@{cheap_ask:.4f} ${bet:.2f} | "
+                f"赔率={odds:.1f}x 潜在利润=${potential_profit:.2f} | "
+                f"BTC={btc:,.2f} vs PTB={ptb:,.2f} diff=${btc_diff:.2f} | "
+                f"elapsed={elapsed_pct:.1%} secs_left={secs_left:.0f}"
             )
+
+            # ── 下单 ──
+            result = await self._submit_order(ctx, order_side, cheap_ask, bet)
+
+            if result and result.status == ExecutionStatus.FILLED:
+                filled_shares = result.filled_size
+                actual_cost = filled_shares * cheap_ask
+
+                if cheap_side == "UP":
+                    self._cum_up_shares += filled_shares
+                    self._cum_up_cost += actual_cost
+                else:
+                    self._cum_dn_shares += filled_shares
+                    self._cum_dn_cost += actual_cost
+
+                self._bets_this_window += 1
+                self._cost_this_window += actual_cost
+                self._last_bet_time = now
+                self._trade_count += 1
+                self._bought_sides.add(cheap_side)
+
+                # ── 记录RTDS偏离度 ──
+                deviation = btc - ptb
+                abs_dev = abs(deviation)
+                dev_record = {
+                    "side": cheap_side,
+                    "deviation": deviation,
+                    "abs_deviation": abs_dev,
+                    "btc": btc,
+                    "ptb": ptb,
+                    "entry_time": now,
+                }
+                self._window_deviations.append(dev_record)
+                self._deviation_stats.append(dev_record)
+
+                self._positions.append({
+                    "side": cheap_side,
+                    "entry_price": cheap_ask,
+                    "shares": filled_shares,
+                    "cost": actual_cost,
+                    "entry_time": now,
+                    "odds": odds,
+                    "btc_at_entry": btc,
+                    "ptb": ptb,
+                    "deviation": deviation,
+                })
+
+                ctx.account.balance -= actual_cost
+                ctx.account.available -= actual_cost
+
+                # ── 记录到 Dashboard 交易历史 ──
+                import datetime as _dt
+                self._trade_history.append({
+                    "action": "ENTRY",
+                    "time": _dt.datetime.fromtimestamp(now).strftime("%H:%M:%S"),
+                    "side": cheap_side,
+                    "price": round(cheap_ask, 4),
+                    "shares": round(filled_shares, 1),
+                    "cost": round(actual_cost, 2),
+                    "odds": round(odds, 1),
+                    "deviation": round(deviation, 2),
+                    "btc": round(btc, 2),
+                    "ptb": round(ptb, 2),
+                    "balance_after": round(ctx.account.balance, 2),
+                    "elapsed_pct": round(elapsed_pct * 100, 1),
+                    "secs_left": round(secs_left, 0),
+                })
+                if len(self._trade_history) > self._max_trade_history:
+                    self._trade_history = self._trade_history[-self._max_trade_history:]
+
+                logger.info(
+                    f"[{self.name()}] ✓ 成交 {cheap_side} | "
+                    f"{filled_shares:.1f}sh@{cheap_ask:.4f}=${actual_cost:.2f} | "
+                    f"RTDS偏离PTB=${deviation:+.2f} (|{abs_dev:.2f}|) | "
+                    f"累计投入: ${self._cost_this_window:.2f}/{self._max_cost_per_window:.0f}"
+                )
 
     # ================================================================
     #  结算
@@ -521,13 +482,15 @@ class TailReversalStrategy(Strategy):
             cheap_side = "DOWN" if btc_up else "UP"
             cheap_ask = dn_ask if btc_up else up_ask
 
-        # 入场区间判断
-        in_entry_zone = self._entry_start_pct <= elapsed_pct <= self._entry_cutoff_pct
-        zone = "WAIT"
-        if elapsed_pct >= self._entry_cutoff_pct:
-            zone = "CUTOFF"
-        elif in_entry_zone:
-            zone = "ACTIVE"
+        # 入场状态判断
+        up_ready = up_ask and abs(up_ask - self._target_ask) < 0.001 and "UP" not in self._bought_sides
+        dn_ready = dn_ask and abs(dn_ask - self._target_ask) < 0.001 and "DOWN" not in self._bought_sides
+        if up_ready or dn_ready:
+            zone = "READY"
+        elif self._bets_this_window >= self._max_bets_per_window:
+            zone = "FULL"
+        else:
+            zone = "SCAN"
 
         total_games = self._win_count + self._loss_count
 
@@ -548,8 +511,8 @@ class TailReversalStrategy(Strategy):
             "elapsed_pct": round(elapsed_pct * 100, 1),
             "secs_left": round(secs_left, 0),
             "entry_zone": zone,
-            "entry_start_pct": round(self._entry_start_pct * 100),
-            "entry_cutoff_pct": round(self._entry_cutoff_pct * 100),
+            "target_ask": self._target_ask,
+            "bought_sides": list(self._bought_sides),
             # ── 当前窗口下注 ──
             "bets_this_window": self._bets_this_window,
             "max_bets_per_window": self._max_bets_per_window,

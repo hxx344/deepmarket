@@ -1,6 +1,6 @@
 # ============================
 # 策略配置: BTC 5-min Tail Reversal v1.0
-# 尾盘反转策略: 在窗口末段买入被推到极端的便宜侧, 赌结算翻转
+# 任意时刻只要 ask=0.01 就买入, 每方向每窗口一次
 # ============================
 strategy:
   name: "tail_reversal"
@@ -9,26 +9,13 @@ strategy:
   enabled: true
 
   params:
-    # ── 入场时机 (窗口末段) ──
-    entry_start_pct: 0.80          # 进度 ≥80% 开始观察 (~60s left)
-    entry_cutoff_pct: 0.95         # 进度 ≥95% 停止入场 (~15s left)
-
-    # ── 价格条件 (核心: 只买最便宜的一侧) ──
-    cheap_side_max_price: 0.01     # ask = 0.01 才入场 (100x 赔率)
-    cheap_side_min_price: 0.01     # ask = 0.01 (地板价)
-
-    # ── 波动率过滤 ──
-    min_btc_vol_30s: 5.0           # 30s 波幅 ≥$5 (要有翻转可能)
+    # ── 价格条件 (核心: ask 精确等于此价格才买) ──
+    target_ask_price: 0.01         # ask = 0.01 → 99x 赔率
 
     # ── 下注大小 (小注博大赔率) ──
     bet_size_usdc: 5.0             # 每次 $5
-    max_bets_per_window: 3         # 每窗口最多 3 注
+    max_bets_per_window: 2         # 每窗口最多 2 注 (UP+DOWN 各1次)
     max_cost_per_window: 20.0      # 每窗口最多 $20
-
-    # ── 反向确认 (可选: 需要 BTC 有反向迹象再入场) ──
-    require_btc_counter_move: false # 不要求反向运动，先观察触发频率
-    counter_move_lookback_s: 5.0   # 5s 内回看
-    counter_move_threshold: 1.0    # BTC 反向 ≥$1
 
     # ── 手续费 ──
     fee_rate: 0.002                # 0.2%

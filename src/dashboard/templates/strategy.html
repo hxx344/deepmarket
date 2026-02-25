@@ -16,8 +16,8 @@
         <h3 class="text-sm font-semibold text-gray-300">Tail Reversal</h3>
         <span class="badge badge-blue text-[10px]">v<span x-text="stratVersion">1.0</span></span>
         <span class="badge text-[10px]"
-              :class="{'badge-green': entryZone === 'ACTIVE', 'badge-yellow': entryZone === 'WAIT', 'badge-red': entryZone === 'CUTOFF'}"
-              x-text="entryZone">WAIT</span>
+              :class="{'badge-green': entryZone === 'READY', 'badge-yellow': entryZone === 'SCAN', 'badge-red': entryZone === 'FULL'}"
+              x-text="entryZone">SCAN</span>
       </div>
       <div class="flex items-center gap-3 text-xs">
         <span class="text-gray-400">模式</span>
@@ -50,8 +50,12 @@
            x-text="cheapSide + ' @' + cheapAsk.toFixed(2)">—</p>
       </div>
       <div class="bg-surface-3 rounded-lg p-3 text-center">
-        <p class="stat-label">BTC 波动(30s)</p>
-        <p class="stat-value !text-lg font-mono text-brand-500" x-text="'$' + btcVol30s.toFixed(2)">$0.00</p>
+        <p class="stat-label">已买方向</p>
+        <p class="stat-value !text-lg font-mono">
+          <span :class="boughtSides.includes('UP') ? 'text-up font-bold' : 'text-gray-600'" x-text="'UP'"></span>
+          <span class="text-gray-600 mx-1">/</span>
+          <span :class="boughtSides.includes('DOWN') ? 'text-down font-bold' : 'text-gray-600'" x-text="'DN'"></span>
+        </p>
       </div>
     </div>
 
@@ -62,18 +66,14 @@
         <span class="font-mono text-white" x-text="elapsedPct.toFixed(1) + '% — ' + formatCountdown(secsLeft) + ' left'"></span>
       </div>
       <div class="relative h-4 bg-surface-3 rounded-full overflow-hidden">
-        <!-- 入场区间标记 -->
-        <div class="absolute top-0 h-full bg-yellow-500/20 z-0"
-             :style="'left:' + entryStartPct + '%; width:' + (entryCutoffPct - entryStartPct) + '%'"></div>
         <!-- 进度 -->
         <div class="absolute top-0 h-full transition-all duration-500 rounded-full z-10"
-             :class="entryZone === 'ACTIVE' ? 'bg-green-500/80' : entryZone === 'CUTOFF' ? 'bg-red-500/60' : 'bg-brand-600/60'"
+             :class="entryZone === 'READY' ? 'bg-green-500/80' : entryZone === 'FULL' ? 'bg-yellow-500/60' : 'bg-brand-600/60'"
              :style="'width:' + elapsedPct + '%'"></div>
       </div>
       <div class="flex justify-between text-[10px] text-gray-500 mt-0.5">
         <span>0%</span>
-        <span :style="'margin-left:' + (entryStartPct - 5) + '%'" class="text-yellow-500">入场开始 (<span x-text="entryStartPct"></span>%)</span>
-        <span class="text-red-500">截止 (<span x-text="entryCutoffPct"></span>%)</span>
+        <span class="text-brand-400">全窗口扫描 ask=<span x-text="targetAsk"></span></span>
         <span>100%</span>
       </div>
     </div>
@@ -310,13 +310,13 @@ function strategyPage() {
     // ── 窗口 ──
     elapsedPct: 0,
     secsLeft: 0,
-    entryZone: 'WAIT',
-    entryStartPct: 80,
-    entryCutoffPct: 95,
+    entryZone: 'SCAN',
+    targetAsk: 0.01,
+    boughtSides: [],
 
     // ── 下注 ──
     betsThisWindow: 0,
-    maxBetsPerWindow: 3,
+    maxBetsPerWindow: 2,
     costThisWindow: 0,
     maxCostPerWindow: 20,
     cumUpShares: 0,
@@ -394,8 +394,8 @@ function strategyPage() {
       if (st.elapsed_pct !== undefined) this.elapsedPct = st.elapsed_pct;
       if (st.secs_left !== undefined) this.secsLeft = st.secs_left;
       if (st.entry_zone) this.entryZone = st.entry_zone;
-      if (st.entry_start_pct !== undefined) this.entryStartPct = st.entry_start_pct;
-      if (st.entry_cutoff_pct !== undefined) this.entryCutoffPct = st.entry_cutoff_pct;
+      if (st.target_ask !== undefined) this.targetAsk = st.target_ask;
+      if (st.bought_sides) this.boughtSides = st.bought_sides;
 
       // ── 下注 ──
       if (st.bets_this_window !== undefined) this.betsThisWindow = st.bets_this_window;
