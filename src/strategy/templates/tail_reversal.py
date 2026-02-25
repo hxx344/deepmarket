@@ -671,9 +671,10 @@ class TailReversalStrategy(Strategy):
         dn_ask = ctx.market.pm_no_ask or ctx.market.pm_no_price
 
         elapsed_pct = (300 - secs_left) / 300.0 if secs_left > 0 else 0
-        zone = "[等待]" if elapsed_pct < self._entry_start_pct else "[观察]"
+        zone = "[扫描]"
         if self._bets_this_window > 0:
-            zone = f"[已下{self._bets_this_window}注]"
+            sides = ",".join(self._bought_sides) if self._bought_sides else ""
+            zone = f"[已买{sides}]"
 
         btc_diff = btc - ptb if ptb > 0 else 0
         logger.debug(
