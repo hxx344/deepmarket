@@ -98,6 +98,65 @@
 - 02-22 10:00-14:00: 全部特征完整 (FULL)
 - 使用 `--rich-only` 参数只用完整数据训练效果更好
 
+### 纯市场特征子集 (PURE_MARKET_NO_TIME)
+- 58 个特征，去除时间特征 (hour/minute/dow/session) 避免过拟合
+- 这是 Model Zoo 默认使用的特征集
+
+## Model Zoo 自优化系统 (2026-02-26)
+
+### 架构
+| 文件 | 说明 |
+|------|------|
+| `scripts/model_zoo.py` | 多模型竞赛 + 自动选优 (961行) |
+| `src/strategy/signals/distill_signal.py` | ML 信号提供者 (策略集成) |
+| `data/distill_models/archive/` | 模型版本归档目录 |
+
+### 支持模型
+| 模型 | 类名 | 依赖 | 状态 |
+|------|------|------|------|
+| LightGBM | `LGBModel` | lightgbm | ✅ 可用 |
+| Logistic Regression | `LRModel` | sklearn | ✅ 可用 |
+| MLP (PyTorch) | `MLPModel` | torch | ⬜ 需安装 |
+| TabNet | `TabNetModel` | pytorch-tabnet | ⬜ 需安装 |
+
+### 模型选择逻辑
+1. 各模型 GroupKFold CV (5折，按窗口分组)
+2. 对每个模型做 PnL 回测 (模拟真实交易)
+3. **主排序**: PnL ROI (投资回报率)
+4. **次排序**: CV AUC
+5. 与当前已部署模型比较 ROI，新模型更优才替换
+6. 旧模型自动归档到 `archive/` 目录
+
+### 最新训练结果 (2026-02-26)
+- **数据**: 1,617 决策点 (rich_only + burst去重)，60 个窗口
+- **LGB**: CV Acc=0.639, AUC=0.713, **ROI=+45.48%**, 胜率=63.4%
+- **LR**: CV Acc=0.677, AUC=0.749, ROI=+27.22%, 胜率=60.0%
+- **胜出**: LGB (ROI 最高)，temporal AUC=0.662
+- 注意: LR 的 AUC 更高但 ROI 更低，说明概率校准不等于收益最优
+
+### CLI 用法
+```bash
+# 多模型竞赛
+python scripts/model_zoo.py --models lgb,lr --force
+# 自动定时重训 (VPS cron)
+python scripts/model_zoo.py --retrain
+# 试运行不保存
+python scripts/model_zoo.py --dry-run
+```
+
+### DistillSignal 信号提供者
+- 继承 `SignalProvider` → 输出 `SignalResult`
+- 支持模型热加载 (文件变化自动重载)
+- 输出: score∈[-1,1], confidence, suggested_sizing∈[0,2]
+- 集成方式: 在策略中实例化后调用 `calculate(ctx)`
+
+## Raw Tick 存储 (2026-02-26)
+- monitor_0x1d.py 新增 `raw_ticks` 表
+- 存储 Binance + Chainlink RTDS 原始 tick 数据
+- 字段: ts, source, price, slug, extra
+- 缓冲写入 (每200条flush)，减少 I/O
+- 为后续序列模型 (LSTM/Transformer) 积累原始数据
+
 ## 0x1d 交易模式
 - **每个窗口都双边交易** (81/81 窗口)
 - **趋势跟踪**: BTC涨→买UP, BTC跌→买DOWN
@@ -111,10 +170,12 @@
 - **Git**: https://github.com/hxx344/deepmarket.git
 
 ## 下一步
-1. **持续采集**: monitor_0x1d.py 在 VPS 24/7 运行，积累 7天+ 完整数据
-2. **重新训练**: 数据充足后 `python scripts/distill_signal.py --rich-only`
-3. **模型集成**: 将信号模型集成到 btc5min_taker 策略，替代手工规则
-4. **黑盒交易**: 最终目标是模型直接输出 (方向, 仓位, 置信度)
+1. **持续采集**: monitor_0x1d.py 在 VPS 24/7 运行，积累原始 tick + 交易快照
+2. **定时重训**: VPS cron 运行 `python scripts/model_zoo.py --retrain`，数据增长后自动更新模型
+3. **安装 PyTorch**: `pip install torch pytorch-tabnet` 启用 MLP/TabNet 模型参与竞赛
+4. **策略集成**: 将 DistillSignal 接入 btc5min_taker 策略，替代手工规则
+5. **序列模型**: 当 raw_ticks 积累到 5000+ 窗口后，尝试 LSTM/Transformer 方案
+6. **黑盒交易**: 最终目标是模型直接输出 (方向, 仓位, 置信度)
 
 ---
-*最后更新: 2026-02-23*
+*最后更新: 2026-02-26*

@@ -37,6 +37,8 @@
   data/distill_models/signal_config.json   — 特征列表 + 信号阈值 + 训练模式
 """
 
+from __future__ import annotations
+
 import sqlite3
 import json
 import sys
@@ -1051,7 +1053,8 @@ def search_best_threshold_by_pnl(df: pd.DataFrame, probs: np.ndarray,
 # 7. 保存模型
 # ══════════════════════════════════════════════════════════════
 
-def save_model(model, eval_results: dict, threshold: float):
+def save_model(model, eval_results: dict, threshold: float,
+               pnl_result: dict | None = None):
     """保存模型 + 配置, 用于生产环境推理"""
     model_path = MODEL_DIR / "signal_model.pkl"
     with open(model_path, "wb") as f:
@@ -1078,12 +1081,21 @@ def save_model(model, eval_results: dict, threshold: float):
         "cv_auc": eval_results["cv_auc"],
         "cv_f1": eval_results["cv_f1"],
         "n_features": len(features_used),
+        "n_samples": eval_results.get("n_samples", len(eval_results.get("df_used", []))),
         "model_type": model_label,
+        "model_class": "lgb",
         "pure_market": "持仓" not in model_label,
         "training_label": eval_results.get("training_mode", "mimicry"),
         "excluded_features": EXCLUDED,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # PnL 元数据 (供 model_zoo 对比使用)
+    if pnl_result:
+        config["pnl_roi"] = pnl_result.get("total_roi", 0)
+        config["pnl_total"] = pnl_result.get("total_pnl", 0)
+        config["pnl_win_rate"] = pnl_result.get("win_rate", 0)
+        config["pnl_n_windows"] = pnl_result.get("n_windows", 0)
 
     config_path = MODEL_DIR / "signal_config.json"
     with open(config_path, "w") as f:
@@ -1294,7 +1306,7 @@ def main():
     )
 
     # ── 保存 ──
-    save_model(model, eval_results, best_t)
+    save_model(model, eval_results, best_t, pnl_result=pnl_conf)
 
     # ── 总结 ──
     print("\n" + "=" * 72)

@@ -104,6 +104,19 @@ def _init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_snaps_slug ON trade_snaps(slug)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_snaps_ts ON trade_snaps(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_settle_slug ON settlements(slug)")
+    # ── 原始 tick 流表 (为未来 DL 序列模型储备数据) ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS raw_ticks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            source TEXT NOT NULL,
+            price REAL NOT NULL,
+            slug TEXT DEFAULT '',
+            extra TEXT DEFAULT '{}'
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ticks_ts ON raw_ticks(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ticks_slug ON raw_ticks(slug)")
     # ── 扩展 settlements 表: 新增窗口级分析字段 (安全 ALTER, 已存在则忽略) ──
     _new_cols = [
         ("up_shares", "REAL DEFAULT 0"),
@@ -134,6 +147,42 @@ def _init_db():
     conn.commit()
     conn.close()
     print(f"[DB] 数据库就绪: {DB_PATH}")
+
+
+# ── 原始 tick 流批量写入缓冲 ──
+_tick_buffer: list[tuple] = []
+_TICK_FLUSH_SIZE = 200          # 每 200 条批量写入一次
+_tick_flush_lock = False
+
+
+def _db_buffer_tick(ts: float, source: str, price: float, slug: str = "",
+                    extra: dict | None = None):
+    """将原始 tick 放入内存缓冲, 满 N 条自动 flush"""
+    global _tick_flush_lock
+    _tick_buffer.append((ts, source, price, slug, json.dumps(extra or {})))
+    if len(_tick_buffer) >= _TICK_FLUSH_SIZE and not _tick_flush_lock:
+        _tick_flush_lock = True
+        try:
+            _db_flush_ticks()
+        finally:
+            _tick_flush_lock = False
+
+
+def _db_flush_ticks():
+    """批量写入 raw_ticks"""
+    if not _tick_buffer:
+        return
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.executemany(
+            "INSERT INTO raw_ticks (ts, source, price, slug, extra) VALUES (?,?,?,?,?)",
+            list(_tick_buffer),
+        )
+        conn.commit()
+        conn.close()
+        _tick_buffer.clear()
+    except Exception as e:
+        print(f"[DB] flush raw ticks 失败: {e}")
 
 
 def _db_save_trade_snap(tx_hash: str, ts: int, slug: str, side: str,
@@ -1319,6 +1368,8 @@ async def binance_btc_stream():
                             # Binance 始终记录 (图表对比 + 独立动量/波动)
                             state.bn_price = price
                             state.bn_price_buffer.append((now, price))
+                            # 存原始 tick (为未来 DL 序列模型储备数据)
+                            _db_buffer_tick(now, "binance", price, state.window_slug)
                             if not state.bn_history or now - state.bn_history[-1]["ts"] >= BTC_DOWNSAMPLE_INTERVAL:
                                 state.bn_history.append({"ts": now, "price": price})
                             # 仅当 RTDS 未连接时, Binance 接管价格更新
@@ -1539,6 +1590,8 @@ async def chainlink_rtds_stream():
 
                                     # 写入价格缓冲区 (用 observationsTimestamp)
                                     state.btc_price_buffer.append((obs_ts, price))
+                                    # 存原始 tick (为未来 DL 序列模型储备数据)
+                                    _db_buffer_tick(obs_ts, "chainlink", price, state.window_slug)
                                     # 降采样 UI 历史
                                     if (not state.btc_history
                                             or now - state.btc_history[-1]["ts"] >= BTC_DOWNSAMPLE_INTERVAL):
@@ -2802,6 +2855,7 @@ async def start_server(port: int):
     except KeyboardInterrupt:
         pass
     finally:
+        _db_flush_ticks()   # 退出前写入剩余 raw ticks
         await runner.cleanup()
 
 
