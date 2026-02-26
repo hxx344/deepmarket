@@ -221,7 +221,7 @@ class MLPModel(BaseModel):
         self.net = self._build_net(self._n_features)
         optimizer = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, patience=10, factor=0.5, verbose=False
+            optimizer, patience=10, factor=0.5
         )
         criterion = nn.BCEWithLogitsLoss()
         
