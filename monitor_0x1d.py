@@ -455,9 +455,9 @@ class MonitorState:
             }
 
             self.settled_windows.append(record)
-            # 只保留最近 500 个窗口
-            if len(self.settled_windows) > 500:
-                self.settled_windows = self.settled_windows[-500:]
+            # 只保留最近 5000 个窗口
+            if len(self.settled_windows) > 5000:
+                self.settled_windows = self.settled_windows[-5000:]
             _db_save_settlement(record)
 
     def lookup_price_at(self, target_ts: float) -> float:
@@ -1705,8 +1705,8 @@ def _do_settle(settle_price: float, ptb: float, src: str = "RTDS"):
             "settle_price": round(settle_price, 2),
             "settle_src": src,
         })
-        if len(state.settled_windows) > 500:
-            state.settled_windows = state.settled_windows[-500:]
+        if len(state.settled_windows) > 5000:
+            state.settled_windows = state.settled_windows[-5000:]
         _q = ps.get('question', '') or ps.get('slug', '')
         print(
             f"[结算] {won} 赢 | PnL=${pnl:.2f} | "
